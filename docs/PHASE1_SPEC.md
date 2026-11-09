@@ -277,7 +277,7 @@ Outgoing mirroring stays a CONFIG flag that counts "would-send" events for valid
 
 ## D. UI System — native design (MEASURED from `ReplicatedStorage/Assets/UI/Game`)
 
-Hierarchy: `ScreenGui "Game"` (ResetOnSpawn=false, ScreenInsets=DeviceSafeInsets, ClipToDeviceSafeArea=true, ZIndexBehavior=Sibling,
+Hierarchy: `ScreenGui "Game"` (ResetOnSpawn=false, ScreenInsets=CoreUISafeInsets, ClipToDeviceSafeArea=true, ZIndexBehavior=Global,
 DisplayOrder 0) → `HUD` (Frame, full screen, transparent) → `Overlay` (same) → `CharacterStatus` (Anchor 0,1; Pos {0,0,1,0};
 Size full) → `BottomLeft` (same).
 
@@ -299,7 +299,7 @@ Size full) → `BottomLeft` (same).
 | `Background` | Image 196969716, color (21,21,21) @0.8, UICorner 4px, ZIndex 0 |
 | `BackgroundStroke` | Size {1,−6,1,−6} centred, UICorner 0.06, **UIStroke 2px (112,255,73) @0.7** |
 | `HealthIcon` | Anchor 0,.5; Pos {0.08,0,0.5207,0}; Size {0.2566,0,0.6414,0}; Aspect 1.1; Image `18788896053` (112,255,73), ZIndex 4; child `HealthIcon` Image `18788900977` white @0.5, ZIndex 3 |
-| `Health` TextLabel | Anchor 1,.5; Pos {0.9,0,0.5,0}; Size {0.5,0,0.5,0}; GothamSSm Bold; TextScaled; (112,255,73); XAlign Right; UIStroke 2px @0.5 |
+| `Health` TextLabel | Anchor 1,.5; Pos {0.9,0,0.5,0}; Size {0.5,0,0.5,0}; GothamSSm Bold; TextScaled; (112,255,73); XAlign Center; UIStroke 2px @0.5 |
 | `Frame` + UIListLayout | Pos {0.775,0,0.6,0}, Size {0.225,0,0.45,0}, empty container (ESTIMATED: status icons) |
 | Driver | `CharacterRegistryTermUpdated("Health")` ← `Humanoid.Health` every frame. Text = `tostring(health)` (raw, decimals possible). Colour = `health < 25 ? (255,78,78) : (112,255,73)`, applied to icon, text and BackgroundStroke stroke. **No fill bar, no tween.** Hidden on death (`Frame.Visible=false`) |
 
