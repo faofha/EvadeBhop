@@ -77,6 +77,14 @@ local CONFIG = {
 	Root = "EvadeClone", -- workspace folder of your executor
 	Verbose = false, -- extra per-step logging
 
+	-- Animation files referenced by AnimationMap are fetched from this URL into <Root>/Animations/
+	-- when missing, so nobody has to download them by hand.  Set Enabled = false to use local files only.
+	AssetDownload = {
+		Enabled = true,
+		BaseUrl = "https://raw.githubusercontent.com/faofha/EvadeBhop/claude/exciting-planck-uv1gh1/Animations/",
+		Redownload = false, -- true = overwrite local copies on every run
+	},
+
 	Movement = { -- MEASURED: Objects/Game/Character/Client/Movement/MoveStats/BaseStats
 		Speed = 1500, -- internal units (studs/s * 90)
 		SprintCap = 2,
@@ -827,27 +835,29 @@ EVADE.SlideParticles = {
 -- slot, so the blend weights/speeds still follow Evade's formulas exactly.
 -- Evade has NO Fall / Air-strafe-Left / Air-strafe-Right tracks: the single Jumping/Jump track covers the
 -- whole airtime, so those files are intentionally not mapped (Evade-exact).
+-- Files live in the repo's Animations/ folder (R6 / Evade "Classic" clips) and are auto-downloaded,
+-- see CONFIG.AssetDownload.
 local AnimationMap = {
-	["Idle/Idle"] = "Idle.rbxm",
-	["Moving/MoveForward"] = "WalkRun.rbxm",
-	["Moving/MoveBackward"] = "WalkRun.rbxm",
-	["Moving/MoveLeft"] = "WalkRun.rbxm",
-	["Moving/MoveRight"] = "WalkRun.rbxm",
-	["Moving/SprintForward"] = "WalkRun.rbxm",
-	["Moving/SprintForwardLeft"] = "WalkRun.rbxm",
-	["Moving/SprintForwardRight"] = "WalkRun.rbxm",
-	["Crouching/Idle"] = "Crouch.rbxm",
-	["Crouching/MoveForward"] = "Crouch.rbxm",
-	["Crouching/MoveBackward"] = "Crouch.rbxm",
-	["Crouching/MoveLeft"] = "Crouch.rbxm",
-	["Crouching/MoveRight"] = "Crouch.rbxm",
-	["Jumping/Jump"] = "Jump.rbxm",
-	["Sliding/Slide"] = "Slide.rbxm",
-	["WallrunningLeft/SprintForward"] = "WalkRun.rbxm",
-	["WallrunningRight/SprintForward"] = "WalkRun.rbxm",
-	["Transitions/Jumping/End"] = "Land.rbxm",
+	["Idle/Idle"] = "idlefixed_11544336826.rbxm",
+	["Moving/MoveForward"] = "clsic_wlkfwrd_17418691532.rbxm",
+	["Moving/MoveBackward"] = "clsc_walkbackward_17418712872.rbxm",
+	["Moving/MoveLeft"] = "clsic_walkleft_17418770762.rbxm",
+	["Moving/MoveRight"] = "clsic_walkright_17418788540.rbxm",
+	["Moving/SprintForward"] = "sprntfwrd_classic_17418483149.rbxm",
+	["Moving/SprintForwardLeft"] = "sprntleft_classic_17418484618.rbxm",
+	["Moving/SprintForwardRight"] = "sprntrght_classic_17418485963.rbxm",
+	["Crouching/Idle"] = "clsic_Crouch_17418836643.rbxm",
+	["Crouching/MoveForward"] = "clsc_crouchforward_17418862116.rbxm",
+	["Crouching/MoveBackward"] = "clsc_crouchbckwrd_17418871218.rbxm",
+	["Crouching/MoveLeft"] = "clsc_crouchleft_17418881872.rbxm",
+	["Crouching/MoveRight"] = "clsc_crouchright_17418893680.rbxm",
+	["Jumping/Jump"] = "r6_jump_17524391617.rbxm",
+	["Sliding/Slide"] = "clsic_slide_17418821942.rbxm",
+	["WallrunningLeft/SprintForward"] = "wallrun_left_18688623622.rbxm",
+	["WallrunningRight/SprintForward"] = "wallrun_right_18688628477.rbxm",
+	["Transitions/Jumping/End"] = "r6jumptransition_18582452487.rbxm",
+	["Transitions/Moving/End"] = "walktransition_18582642963.rbxm",
 	-- Evade slot not supplied by you -> set to a file name to enable, or false to silence the warning.
-	["Transitions/Moving/End"] = false,
 	["Transitions/Sliding/End"] = false,
 	["Transitions/Moving_RootStraight/End"] = false,
 }
@@ -1184,6 +1194,44 @@ function Assets.WriteFile(path, content)
 	end
 	return ok
 end
+-- Fetches every file named in AnimationMap from CONFIG.AssetDownload.BaseUrl into <Root>/Animations/
+-- when it isn't there yet, so the getcustomasset pipeline below finds it.
+function Assets.DownloadAnimations()
+	local cfg = CONFIG.AssetDownload
+	if not (cfg and cfg.Enabled) then
+		return
+	end
+	if not Cap.writefile then
+		Log.warnOnce("dl:nowrite", "Assets", "writefile missing: cannot auto-download animations")
+		return
+	end
+	local seen, fetched, failed = {}, 0, 0
+	for _, fileName in AnimationMap do
+		if type(fileName) == "string" and not seen[fileName] then
+			seen[fileName] = true
+			local path = Assets.Path("Animations", fileName)
+			if cfg.Redownload or not Assets.IsFile(path) then
+				local url = cfg.BaseUrl .. fileName
+				local ok, body = pcall(function()
+					return game:HttpGet(url)
+				end)
+				-- A valid binary .rbxm starts with "<roblox!"; anything else is an error page.
+				if ok and type(body) == "string" and string.sub(body, 1, 8) == "<roblox!" then
+					if Assets.WriteFile(path, body) then
+						fetched += 1
+					else
+						failed += 1
+					end
+				else
+					failed += 1
+					Log.warnOnce("dl:" .. fileName, "Assets", ("download failed: %s (%s)"):format(url, ok and "not an .rbxm" or tostring(body)))
+				end
+			end
+		end
+	end
+	Log.info("Assets", ("animation download: %d fetched, %d failed"):format(fetched, failed))
+end
+
 function Assets.CustomAsset(path)
 	if not Assets.IsFile(path) then
 		Assets.Report[path] = "missing file"
@@ -4065,6 +4113,7 @@ local function main()
 	capabilityReport()
 	GENV.EvadeClone = { Unload = unload, Config = CONFIG, Version = VERSION, Validation = Validation }
 	Assets.EnsureFolders()
+	Assets.DownloadAnimations()
 	Assets.LoadEvadeTrackLengths()
 	Assets.FootstepOverrides = Assets.LoadFootstepOverrides()
 	Input.Init()

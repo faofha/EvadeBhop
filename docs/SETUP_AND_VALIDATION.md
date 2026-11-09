@@ -6,17 +6,16 @@ Script: `EvadeClone.lua` (single file). Spec: `docs/PHASE1_SPEC.md`.
 
 ## 1. Asset checklist
 
-Put everything inside your executor's **workspace** folder:
+**Animations need no manual setup.** The 19 R6 clips live in this repo's `Animations/` folder. On
+startup the script downloads any missing ones (`game:HttpGet` from `CONFIG.AssetDownload.BaseUrl`) into
+`EvadeClone/Animations/` and loads them with `getcustomasset` → `GetObjects`. If you move the files to
+another branch or repo, change `BaseUrl`. Set `Redownload = true` to refresh local copies.
+
+Everything else optional goes inside your executor's **workspace** folder:
 
 ```
 EvadeClone/
-├── Animations/
-│   ├── Idle.rbxm       -> Idle/Idle
-│   ├── WalkRun.rbxm    -> Moving/* (7 slots) + WallrunningLeft/Right/SprintForward
-│   ├── Jump.rbxm       -> Jumping/Jump   (plays for the WHOLE airtime, like Evade)
-│   ├── Land.rbxm       -> Transitions/Jumping/End  (one-shot on touchdown)
-│   ├── Slide.rbxm      -> Sliding/Slide  (ground slide AND crouch-in-air "SlideAir")
-│   └── Crouch.rbxm     -> Crouching/* (Idle + MoveForward/Backward/Left/Right)
+├── Animations/                      (filled automatically; see AnimationMap in the script)
 ├── UI/
 │   └── HUD.rbxm  or  HUD.rbxmx     (optional — native Evade layout is built if absent)
 ├── Sounds/                          (optional — Evade sound IDs are used if absent)
