@@ -1293,7 +1293,8 @@ function Assets.FindFirstOfClass(objects, className)
 end
 
 -- Resolves an Animation for one slot. Fallback chain:
---   1. KeyframeSequence in the .rbxm -> KeyframeSequenceProvider:RegisterKeyframeSequence
+--   1. KeyframeSequence in the .rbxm -> KeyframeSequenceProvider:RegisterKeyframeSequence (Studio only)
+--   1b. same KeyframeSequence -> built-in KeyframePlayer (live games; drives Motor6D.Transform)
 --   2. Animation instance inside the .rbxm (its AnimationId)
 --   3. CONFIG.Animation.IdOverrides[slot]
 --   -> nil (slot disabled, warned once)
@@ -1306,7 +1307,7 @@ function Assets.ResolveAnimation(slot, fileName)
 	end
 	local objects = Assets.LoadObjects(path)
 	local ks = Assets.FindFirstOfClass(objects, "KeyframeSequence")
-	if ks and Cap.KeyframeSequenceProvider then
+	if ks and Cap.KeyframeSequenceProvider and not Assets.KSPStudioOnly then
 		local ok, id = pcall(function()
 			return Cap.KeyframeSequenceProvider:RegisterKeyframeSequence(ks)
 		end)
@@ -1314,7 +1315,18 @@ function Assets.ResolveAnimation(slot, fileName)
 			registeredIdsByFile[path] = { id = id, source = "RegisterKeyframeSequence", ks = ks }
 			return id, "RegisterKeyframeSequence", ks
 		end
-		Log.warnOnce("ksp:" .. path, "Assets", ("RegisterKeyframeSequence failed for %s (%s); trying fallbacks"):format(fileName, tostring(id)))
+		-- Live servers reject it ("can only be called in Studio"); stop asking after the first refusal.
+		if string.find(tostring(id), "Studio", 1, true) then
+			Assets.KSPStudioOnly = true
+			Log.info("Assets", "RegisterKeyframeSequence is Studio-only here; using the built-in keyframe player")
+		else
+			Log.warnOnce("ksp:" .. path, "Assets", ("RegisterKeyframeSequence failed for %s (%s); trying fallbacks"):format(fileName, tostring(id)))
+		end
+	end
+	-- Play the KeyframeSequence ourselves by driving Motor6D.Transform (see KeyframePlayer).
+	if ks then
+		registeredIdsByFile[path] = { id = "keyframes", source = "KeyframePlayer", ks = ks }
+		return "keyframes", "KeyframePlayer", ks
 	end
 	local anim = Assets.FindFirstOfClass(objects, "Animation")
 	if anim and anim.AnimationId ~= "" then
@@ -2814,6 +2826,243 @@ end
 --==============================================================================
 -- SECTION 13 : ANIMATOR (Character/Animations: SetModule / SetCurrentAnimation / UpdateAnimations)
 --==============================================================================
+--------------------------------------------------------------------------------
+-- KeyframePlayer: plays a KeyframeSequence without an AnimationId, for live games where
+-- KeyframeSequenceProvider:RegisterKeyframeSequence is Studio-only.  Each KPTrack exposes the
+-- AnimationTrack members the Animator uses (Play/Stop/AdjustSpeed/AdjustWeight/Destroy, Length,
+-- TimePosition, Speed, IsPlaying, WeightCurrent, Priority, Looped), and the player blends all
+-- tracks per joint into Motor6D.Transform every Stepped.
+-- Blend: higher priority layers take their (capped) weight first, the rest falls to lower layers;
+-- tracks in one layer are weight-averaged; any weight left over keeps the joint's rest pose.
+--------------------------------------------------------------------------------
+local KPTrack = {}
+KPTrack.__index = KPTrack
+
+local DEFAULT_FADE = 0.100000001
+local EASING_STYLE = {
+	Linear = Enum.EasingStyle.Linear,
+	Cubic = Enum.EasingStyle.Cubic,
+	CubicV2 = Enum.EasingStyle.Cubic,
+	Elastic = Enum.EasingStyle.Elastic,
+	Bounce = Enum.EasingStyle.Bounce,
+}
+-- PoseEasingDirection In/Out are mirrored relative to TweenService's.
+local EASING_DIR = { In = Enum.EasingDirection.Out, Out = Enum.EasingDirection.In, InOut = Enum.EasingDirection.InOut }
+
+local function priorityRank(p)
+	if p == Enum.AnimationPriority.Core then
+		return -1
+	end
+	return p.Value
+end
+
+-- KeyframeSequence -> { [jointName] = { {t, cf, style, dir}, ... sorted by t } }, length
+local function compileSequence(ks)
+	local curves, length = {}, 0
+	for _, kf in ks:GetKeyframes() do
+		length = math.max(length, kf.Time)
+		for _, pose in kf:GetDescendants() do
+			if pose:IsA("Pose") and pose.Weight > 0 then
+				local list = curves[pose.Name]
+				if not list then
+					list = {}
+					curves[pose.Name] = list
+				end
+				table.insert(list, { kf.Time, pose.CFrame, pose.EasingStyle.Name, pose.EasingDirection.Name })
+			end
+		end
+	end
+	for _, list in curves do
+		table.sort(list, function(a, b)
+			return a[1] < b[1]
+		end)
+	end
+	return curves, length
+end
+
+local function sampleCurve(list, t)
+	local n = #list
+	if t <= list[1][1] then
+		return list[1][2]
+	end
+	if t >= list[n][1] then
+		return list[n][2]
+	end
+	local lo, hi = 1, n
+	while hi - lo > 1 do
+		local mid = (lo + hi) // 2
+		if list[mid][1] <= t then
+			lo = mid
+		else
+			hi = mid
+		end
+	end
+	local a, b = list[lo], list[hi]
+	if a[3] == "Constant" then
+		return a[2]
+	end
+	local alpha = (t - a[1]) / (b[1] - a[1])
+	local style = EASING_STYLE[a[3]]
+	if style and style ~= Enum.EasingStyle.Linear then
+		alpha = TweenService:GetValue(alpha, style, EASING_DIR[a[4]] or Enum.EasingDirection.In)
+	end
+	return a[2]:Lerp(b[2], alpha)
+end
+
+function KPTrack.new(player, ks, name)
+	local curves, length = compileSequence(ks)
+	return setmetatable({
+		Player = player,
+		Curves = curves,
+		Name = name,
+		Length = length,
+		Looped = ks.Loop,
+		Priority = ks.Priority,
+		TimePosition = 0,
+		Speed = 1,
+		IsPlaying = false,
+		WeightCurrent = 0,
+		WeightTarget = 0,
+		FadeRate = math.huge,
+	}, KPTrack)
+end
+
+function KPTrack:SetTarget(target, fade)
+	fade = fade or DEFAULT_FADE
+	self.WeightTarget = target
+	self.FadeRate = fade > 0 and math.max(math.abs(target - self.WeightCurrent), 1e-3) / fade or math.huge
+end
+
+function KPTrack:Play(fade, weight, speed)
+	if not self.IsPlaying then
+		self.TimePosition = 0
+		self.IsPlaying = true
+		self.Player.Active[self] = true
+	end
+	self.Speed = speed or 1
+	self:SetTarget(weight or 1, fade)
+end
+
+function KPTrack:Stop(fade)
+	if self.IsPlaying then
+		self:SetTarget(0, fade)
+	end
+end
+
+function KPTrack:AdjustSpeed(speed)
+	self.Speed = speed or 1
+end
+
+function KPTrack:AdjustWeight(weight, fade)
+	self:SetTarget(weight or 1, fade)
+end
+
+function KPTrack:Destroy()
+	self.IsPlaying = false
+	self.WeightCurrent = 0
+	self.Player.Active[self] = nil
+end
+
+function KPTrack:Step(dt)
+	local diff = self.WeightTarget - self.WeightCurrent
+	local stepW = self.FadeRate * dt
+	self.WeightCurrent = math.abs(diff) <= stepW and self.WeightTarget or self.WeightCurrent + math.sign(diff) * stepW
+	if self.WeightTarget <= 0 and self.WeightCurrent <= 0 then
+		self.IsPlaying = false
+		self.Player.Active[self] = nil
+		return
+	end
+	local len = self.Length
+	local t = self.TimePosition + dt * self.Speed
+	if len <= 0 then
+		t = 0
+	elseif self.Looped then
+		t %= len
+	elseif t >= len or t <= 0 then
+		t = math.clamp(t, 0, len)
+		if self.WeightTarget > 0 then
+			self:SetTarget(0, DEFAULT_FADE) -- non-looped track ends, holding its last pose while fading
+		end
+	end
+	self.TimePosition = t
+end
+
+local KeyframePlayer = {}
+KeyframePlayer.__index = KeyframePlayer
+
+function KeyframePlayer.new(character, maid)
+	local self = setmetatable({ Active = {}, Motors = {}, Character = character }, KeyframePlayer)
+	for _, m in character:GetDescendants() do
+		if m:IsA("Motor6D") and m.Part1 then
+			self.Motors[m.Part1.Name] = m
+		end
+	end
+	maid:Give(RunService.Stepped:Connect(function(_, dt)
+		self:Step(dt)
+	end))
+	maid:Give(function()
+		for _, m in self.Motors do
+			pcall(function()
+				m.Transform = CFrame.identity
+			end)
+		end
+	end)
+	return self
+end
+
+function KeyframePlayer:NewTrack(ks, name)
+	return KPTrack.new(self, ks, name)
+end
+
+function KeyframePlayer:Step(dt)
+	local layers = {}
+	for track in self.Active do
+		track:Step(dt)
+		if self.Active[track] and track.WeightCurrent > 0 then
+			local rank = priorityRank(track.Priority)
+			layers[rank] = layers[rank] or {}
+			table.insert(layers[rank], track)
+		end
+	end
+	local ranks = {}
+	for r in layers do
+		table.insert(ranks, r)
+	end
+	table.sort(ranks, function(a, b)
+		return a > b
+	end)
+	for jointName, motor in self.Motors do
+		local acc, total, remaining = CFrame.identity, 0, 1
+		for _, r in ranks do
+			local sum = 0
+			for _, track in layers[r] do
+				if track.Curves[jointName] then
+					sum += track.WeightCurrent
+				end
+			end
+			if sum > 0 then
+				local share = remaining * math.min(sum, 1) / sum
+				for _, track in layers[r] do
+					local curve = track.Curves[jointName]
+					if curve then
+						local w = track.WeightCurrent * share
+						total += w
+						acc = acc:Lerp(sampleCurve(curve, track.TimePosition), w / total)
+					end
+				end
+				remaining *= 1 - math.min(sum, 1)
+				if remaining <= 0 then
+					break
+				end
+			end
+		end
+		if total < 1 then
+			acc = CFrame.identity:Lerp(acc, total)
+		end
+		motor.Transform = acc
+	end
+end
+
 local Animator = {}
 Animator.__index = Animator
 
@@ -2897,6 +3146,19 @@ function Animator:LoadTrack(slot, fileName, maid)
 		self.Report[slot] = "UNRESOLVED (" .. fileName .. ")"
 		Log.warnOnce("anim-unresolved:" .. slot, "Animator", ("slot %s: could not load %s; slot disabled"):format(slot, fileName))
 		return nil
+	end
+	if source == "KeyframePlayer" then
+		if not self.KeyframePlayer then
+			self.KeyframePlayer = KeyframePlayer.new(self.Ctx.Character, maid)
+		end
+		local track = self.KeyframePlayer:NewTrack(ks, string.match(slot, "([^/]+)$"))
+		if CONFIG.Animation.ForceEstimatedPriority then
+			track.Priority = self:EstimatedPriority(slot) or track.Priority
+		end
+		self.OwnedTracks[track] = true
+		self.SlotByTrack[track] = slot
+		self.Report[slot] = ("OK via KeyframePlayer (%s, %.2fs)"):format(fileName, track.Length)
+		return track
 	end
 	local anim = Instance.new("Animation")
 	anim.Name = string.match(slot, "([^/]+)$")

@@ -11,6 +11,11 @@ startup the script downloads any missing ones (`game:HttpGet` from `CONFIG.Asset
 `EvadeClone/Animations/` and loads them with `getcustomasset` → `GetObjects`. If you move the files to
 another branch or repo, change `BaseUrl`. Set `Redownload = true` to refresh local copies.
 
+`RegisterKeyframeSequence` only works in Studio, so in live games the script plays each
+KeyframeSequence with its own keyframe player, which writes `Motor6D.Transform` every `Stepped`.
+Because of this, the animations run without any uploaded AnimationId. Other players' clients don't
+replicate `Transform`, so the animations are client-side only.
+
 Everything else optional goes inside your executor's **workspace** folder:
 
 ```
