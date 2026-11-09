@@ -2990,6 +2990,46 @@ end
 local KeyframePlayer = {}
 KeyframePlayer.__index = KeyframePlayer
 
+-- Evade's Classic rig (from the pose tree in its KeyframeSequences):
+--   HumanoidRootPart > TorsoRot > { Torso > Head, Left Leg, Right Leg, ArmRot > { Left Arm, Right Arm } }
+-- Every joint frame is axis-aligned with the torso (X = pitch, Y = yaw), unlike stock R6 whose
+-- hips/shoulders are turned 90 degrees.  We rebuild that rig in torso space and solve each stock
+-- Motor6D.Transform so the stock parts land where Evade's would.
+local function about(pivot, t)
+	return CFrame.new(pivot) * t * CFrame.new(-pivot)
+end
+
+function KeyframePlayer:SetupR6Retarget(character)
+	local hrp, torso = character:FindFirstChild("HumanoidRootPart"), character:FindFirstChild("Torso")
+	if not (hrp and torso) then
+		return
+	end
+	local function motor(parent, name)
+		local m = parent:WaitForChild(name, 3) -- joints can arrive a moment after the character
+		return (m and m:IsA("Motor6D")) and m or nil
+	end
+	local rig = {}
+	for key, spec in { RootJoint = { hrp, "RootJoint" }, Neck = { torso, "Neck" }, ["Left Arm"] = { torso, "Left Shoulder" }, ["Right Arm"] = { torso, "Right Shoulder" }, ["Left Leg"] = { torso, "Left Hip" }, ["Right Leg"] = { torso, "Right Hip" } } do
+		rig[key] = motor(spec[1], spec[2])
+		if not rig[key] then
+			Log.warnOnce("kp-r6", "Animator", ("R6 joint %s missing; animations play without Evade-rig retargeting"):format(spec[2]))
+			return
+		end
+	end
+	rig.TorsoRest = rig.RootJoint.C0 * rig.RootJoint.C1:Inverse()
+	rig.TorsoRestInv = rig.TorsoRest:Inverse()
+	-- pivots in torso space (a joint's C0 position is its pivot in Part0 space)
+	rig.Pivot = {
+		Head = rig.Neck.C0.Position,
+		["Left Arm"] = rig["Left Arm"].C0.Position,
+		["Right Arm"] = rig["Right Arm"].C0.Position,
+		["Left Leg"] = rig["Left Leg"].C0.Position,
+		["Right Leg"] = rig["Right Leg"].C0.Position,
+		ArmRot = Vector3.new(0, rig["Right Arm"].C0.Position.Y, 0), -- ESTIMATED: shoulder line
+	}
+	self.R6 = rig
+end
+
 function KeyframePlayer.new(character, maid)
 	local self = setmetatable({ Active = {}, Motors = {}, Character = character }, KeyframePlayer)
 	for _, m in character:GetDescendants() do
@@ -2997,6 +3037,7 @@ function KeyframePlayer.new(character, maid)
 			self.Motors[m.Part1.Name] = m
 		end
 	end
+	self:SetupR6Retarget(character)
 	maid:Give(RunService.Stepped:Connect(function(_, dt)
 		self:Step(dt)
 	end))
@@ -3031,19 +3072,19 @@ function KeyframePlayer:Step(dt)
 	table.sort(ranks, function(a, b)
 		return a > b
 	end)
-	for jointName, motor in self.Motors do
+	local function blend(boneName)
 		local acc, total, remaining = CFrame.identity, 0, 1
 		for _, r in ranks do
 			local sum = 0
 			for _, track in layers[r] do
-				if track.Curves[jointName] then
+				if track.Curves[boneName] then
 					sum += track.WeightCurrent
 				end
 			end
 			if sum > 0 then
 				local share = remaining * math.min(sum, 1) / sum
 				for _, track in layers[r] do
-					local curve = track.Curves[jointName]
+					local curve = track.Curves[boneName]
 					if curve then
 						local w = track.WeightCurrent * share
 						total += w
@@ -3059,7 +3100,36 @@ function KeyframePlayer:Step(dt)
 		if total < 1 then
 			acc = CFrame.identity:Lerp(acc, total)
 		end
-		motor.Transform = acc
+		return acc
+	end
+	local rig = self.R6
+	if not rig then
+		for jointName, motor in self.Motors do
+			motor.Transform = blend(jointName)
+		end
+		return
+	end
+	-- Evade rig forward kinematics in torso space (deltas from the rest pose).
+	local wTorsoRot = blend("TorsoRot")
+	local wTorso = wTorsoRot * blend("Torso")
+	local wArmRot = wTorsoRot * about(rig.Pivot.ArmRot, blend("ArmRot"))
+	local delta = {
+		Torso = wTorso,
+		Head = wTorso * about(rig.Pivot.Head, blend("Head")),
+		["Left Arm"] = wArmRot * about(rig.Pivot["Left Arm"], blend("Left Arm")),
+		["Right Arm"] = wArmRot * about(rig.Pivot["Right Arm"], blend("Right Arm")),
+		["Left Leg"] = wTorsoRot * about(rig.Pivot["Left Leg"], blend("Left Leg")),
+		["Right Leg"] = wTorsoRot * about(rig.Pivot["Right Leg"], blend("Right Leg")),
+	}
+	-- Stock motors: Part1 = Part0 * C0 * Transform * C1^-1, all in HRP space.
+	-- Animated torso (HRP space) = TorsoRest * delta.Torso; animated limb = that * C0 * C1^-1 under delta.
+	local root = rig.RootJoint
+	local torsoAnim = rig.TorsoRest * wTorso
+	root.Transform = root.C0:Inverse() * torsoAnim * root.C1
+	local torsoInv = wTorso:Inverse()
+	for part, m in { Head = rig.Neck, ["Left Arm"] = rig["Left Arm"], ["Right Arm"] = rig["Right Arm"], ["Left Leg"] = rig["Left Leg"], ["Right Leg"] = rig["Right Leg"] } do
+		-- limb in torso space: rest = C0 * C1^-1, animated = torsoInv * delta * rest
+		m.Transform = m.C0:Inverse() * torsoInv * delta[part] * m.C0
 	end
 end
 
@@ -3743,6 +3813,9 @@ end
 -- CharacterStatus.SetHealth: raw tostring, red under 25 else green on icon/text/stroke. No tween.
 function UI.SetHealth(value, maxHealth)
 	local el = UI.Elements
+	-- Evade's server keeps health integral; a stock Humanoid regenerates fractionally, so round up
+	-- (never shows 0 while alive).
+	value = math.max(math.ceil(value - 1e-6), 0)
 	if UI.HealthValue == value then
 		return
 	end

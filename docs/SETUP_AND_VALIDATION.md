@@ -13,8 +13,16 @@ another branch or repo, change `BaseUrl`. Set `Redownload = true` to refresh loc
 
 `RegisterKeyframeSequence` only works in Studio, so in live games the script plays each
 KeyframeSequence with its own keyframe player, which writes `Motor6D.Transform` every `Stepped`.
-Because of this, the animations run without any uploaded AnimationId. Other players' clients don't
-replicate `Transform`, so the animations are client-side only.
+Because of this, the animations run without any uploaded AnimationId. The clips were made for Evade's
+Classic rig, which has `HumanoidRootPart > TorsoRot > { Torso > Head, legs, ArmRot > arms }` with
+torso-aligned joint frames. The player rebuilds that rig in torso space and solves the stock R6
+Motor6Ds from it. The `ArmRot` pivot (shoulder line) is estimated.
+
+Other players can't see these animations. `Motor6D.Transform` doesn't replicate, and an AnimationTrack
+replicates only as an AnimationId that every other client loads itself. `rbxasset://` (getcustomasset)
+and `active://` (KeyframeSequenceProvider) IDs exist only on your machine, and Evade's uploaded IDs
+only load in Evade's own games. Infinite Yield's `dance`/`emote` commands are visible to others
+because they use Roblox-owned animation and catalog emote IDs.
 
 Everything else optional goes inside your executor's **workspace** folder:
 
