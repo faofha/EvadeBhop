@@ -2496,7 +2496,14 @@ local Shared = { SettingsOpen = false, TouchDelta = Vector2.zero }
 -- be locked: Roblox turns touches (including the joystick drag) into emulated mouse movement, so a
 -- locked mouse made the camera follow the joystick.  The camera turns from screen drags instead.
 local function touchOnly()
-	return CONFIG.UI.ForceMobile == true or (UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled)
+	if CONFIG.UI.ForceMobile == true then
+		return true
+	end
+	-- Some phones report a keyboard or mouse, so also trust the input actually in use.
+	if UserInputService:GetLastInputType() == Enum.UserInputType.Touch then
+		return true
+	end
+	return UserInputService.TouchEnabled and not (UserInputService.KeyboardEnabled and UserInputService.MouseEnabled)
 end
 
 local CameraFX = {}
@@ -4478,7 +4485,7 @@ function UI.IsTouchOnControls(pos)
 end
 
 function UI.IsMobile()
-	return CONFIG.UI.ForceMobile == true or (UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled)
+	return touchOnly()
 end
 
 -- MEASURED MobileButtons.ButtonActive
