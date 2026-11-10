@@ -178,7 +178,7 @@ local CONFIG = {
 		-- head, arms, root and accessories are hidden.  FOV above 90 hides everything ("None").
 		FirstPersonVisibility = "NoArms",
 		POVScroll = true, -- MEASURED Config/Player/Settings POVScroll default true (settings menu)
-		TouchLookSpeed = Vector2.new(0.00945 * math.pi, 0.003375 * math.pi), -- Roblox touch pan, rad per pixel
+		TouchLookSpeed = Vector2.new(1, 0.66) * math.rad(1), -- Roblox CameraInput ROTATION_SPEED_TOUCH, rad per pixel
 		ZoomRate = 12, -- zoom smoothing (1/s)
 		MaxPitch = math.rad(80), -- MEASURED: MaxY/MinY +-80
 		GamepadLookSpeed = Vector2.new(4.5, 3), -- rad/s at full right-stick deflection
@@ -2492,6 +2492,20 @@ end
 -- State shared between the camera and the settings panel (UI is declared later in the file).
 local Shared = { SettingsOpen = false, TouchDelta = Vector2.zero }
 
+-- Touch-only device (phone/tablet without keyboard), or forced for testing.  On these the mouse must NOT
+-- be locked: Roblox turns touches (including the joystick drag) into emulated mouse movement, so a
+-- locked mouse made the camera follow the joystick.  The camera turns from screen drags instead.
+local function touchOnly()
+	if CONFIG.UI.ForceMobile == true then
+		return true
+	end
+	-- Some phones report a keyboard or mouse, so also trust the input actually in use.
+	if UserInputService:GetLastInputType() == Enum.UserInputType.Touch then
+		return true
+	end
+	return UserInputService.TouchEnabled and not (UserInputService.KeyboardEnabled and UserInputService.MouseEnabled)
+end
+
 local CameraFX = {}
 CameraFX.__index = CameraFX
 
@@ -2650,8 +2664,11 @@ function CameraFX:UpdateThirdPerson(dt)
 		cam.CameraType = Enum.CameraType.Scriptable
 	end
 	if not Shared.SettingsOpen then
-		UserInputService.MouseBehavior = Enum.MouseBehavior.LockCenter
-		local d = UserInputService:GetMouseDelta()
+		local d = Vector2.zero
+		if not touchOnly() then -- on touch devices mouse delta also carries the joystick drag
+			UserInputService.MouseBehavior = Enum.MouseBehavior.LockCenter
+			d = UserInputService:GetMouseDelta()
+		end
 		local sens = 1
 		pcall(function()
 			sens = UserSettings():GetService("UserGameSettings").MouseSensitivity
@@ -2722,7 +2739,7 @@ function CameraFX:UpdateType()
 	-- Both camera types keep the mouse locked (Evade: first person and shift-lock third person).
 	-- Roblox's camera caches the mode it last set and won't reapply it after anything else changes it,
 	-- so the lock is enforced here every frame; the settings panel frees it while open.
-	if not Shared.SettingsOpen and UserInputService.MouseBehavior ~= Enum.MouseBehavior.LockCenter then
+	if not Shared.SettingsOpen and not touchOnly() and UserInputService.MouseBehavior ~= Enum.MouseBehavior.LockCenter then
 		UserInputService.MouseBehavior = Enum.MouseBehavior.LockCenter
 	end
 end
@@ -4440,8 +4457,35 @@ end
 --------------------------------------------------------------------------------
 UI.MobileHandlers = {}
 
+-- True when a touch starts on Roblox's touch controls (joystick frames, jump button) or on one of the
+-- mobile buttons; such touches never turn the camera (like Roblox's own isInDynamicThumbstickArea).
+function UI.IsTouchOnControls(pos)
+	local function inside(g)
+		local p, s = g.AbsolutePosition, g.AbsoluteSize
+		return pos.X >= p.X and pos.X <= p.X + s.X and pos.Y >= p.Y and pos.Y <= p.Y + s.Y
+	end
+	local pg = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+	local tg = pg and pg:FindFirstChild("TouchGui")
+	local frame = tg and tg:IsA("ScreenGui") and tg.Enabled and tg:FindFirstChild("TouchControlFrame")
+	if frame and frame:IsA("GuiObject") and frame.Visible then
+		for _, ch in frame:GetChildren() do
+			if ch:IsA("GuiObject") and ch.Visible and inside(ch) then
+				return true
+			end
+		end
+	end
+	if UI.MobileFrame then
+		for _, b in UI.MobileFrame:GetDescendants() do
+			if b:IsA("GuiButton") and b.Visible and inside(b) then
+				return true
+			end
+		end
+	end
+	return false
+end
+
 function UI.IsMobile()
-	return CONFIG.UI.ForceMobile == true or (UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled)
+	return touchOnly()
 end
 
 -- MEASURED MobileButtons.ButtonActive
@@ -5214,7 +5258,7 @@ local function bindInput()
 	-- Touch camera: only touches that began outside GUI/thumbstick (processed == false) turn the camera.
 	local cameraTouches = {}
 	App.Maid:Give(UserInputService.InputBegan:Connect(function(input, processed)
-		if input.UserInputType == Enum.UserInputType.Touch and not processed then
+		if input.UserInputType == Enum.UserInputType.Touch and not processed and not UI.IsTouchOnControls(input.Position) then
 			cameraTouches[input] = true
 		end
 	end))
