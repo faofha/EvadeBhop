@@ -147,10 +147,7 @@ local CONFIG = {
 		FOVMin = 70,
 		FOVMax = 100,
 		-- Third person is a script-driven shift-lock camera: the mouse turns it without right-click.
-		-- Scroll out from first person enters third person; scroll in past ThirdPersonMinZoom returns.
-		ThirdPersonMinZoom = 2,
-		ThirdPersonMaxZoom = 20,
-		ZoomStepFactor = 1.25, -- per wheel notch
+		-- Mouse wheel switches between the two fixed positions (first person / ThirdPersonZoom).
 		ZoomRate = 12, -- zoom smoothing (1/s)
 		MaxPitch = math.rad(80), -- MEASURED: MaxY/MinY +-80
 		GamepadLookSpeed = Vector2.new(4.5, 3), -- rad/s at full right-stick deflection
@@ -2426,7 +2423,7 @@ end
 -- SECTION 11 : CAMERA  (CameraService FOV + ViewmodelDeviation Camera/Grounded springs + camera type)
 --==============================================================================
 -- State shared between the camera and the settings panel (UI is declared later in the file).
-local Shared = { SettingsOpen = false, ThirdPersonZoom = nil }
+local Shared = { SettingsOpen = false }
 
 local CameraFX = {}
 CameraFX.__index = CameraFX
@@ -2446,7 +2443,7 @@ function CameraFX.new(ctx)
 		Roll = 0,
 		Yaw = 0,
 		Pitch = 0,
-		Zoom = Shared.ThirdPersonZoom or CONFIG.Camera.ThirdPersonZoom, -- remembered across respawns
+		Zoom = CONFIG.Camera.ThirdPersonZoom, -- MEASURED: fixed third-person distance
 		ZoomCurrent = CONFIG.Camera.FirstPersonZoom,
 		GamepadLook = Vector2.zero,
 	}, CameraFX)
@@ -2528,25 +2525,14 @@ function CameraFX:ToggleThirdPerson()
 	self:ApplyCameraType(false)
 end
 
--- Mouse wheel: scroll out from first person -> third person; in third person it zooms, and scrolling
--- in past ThirdPersonMinZoom returns to first person (Roblox-style).
+-- Mouse wheel, Evade-style: two fixed positions.  Scroll out in first person -> third person at the
+-- fixed ThirdPersonZoom (further scrolling out stays there); scroll in in third person -> first person.
 function CameraFX:OnWheel(z)
-	local c = CONFIG.Camera
-	if not self.ThirdPerson then
-		if z < 0 then
-			self.Zoom = c.ThirdPersonZoom
-			Shared.ThirdPersonZoom = self.Zoom
-			self:ToggleThirdPerson()
-		end
-		return
-	end
-	local nz = z > 0 and self.Zoom / c.ZoomStepFactor or self.Zoom * c.ZoomStepFactor
-	if nz < c.ThirdPersonMinZoom - 1e-3 then
+	if z < 0 and not self.ThirdPerson then
 		self:ToggleThirdPerson()
-		return
+	elseif z > 0 and self.ThirdPerson then
+		self:ToggleThirdPerson()
 	end
-	self.Zoom = clamp(nz, c.ThirdPersonMinZoom, c.ThirdPersonMaxZoom)
-	Shared.ThirdPersonZoom = self.Zoom
 end
 
 -- Third person: shift-lock style camera (Evade ShiftLockOffset (2, 0.5, 0)), mouse turns it directly.
@@ -2608,6 +2594,12 @@ function CameraFX:UpdateType()
 	local ctx = self.Ctx
 	local drop = (ctx.RootSize.Y - CONFIG.Hull.StandSize.Y * ctx.SizeScale) / 2
 	ctx.Humanoid.CameraOffset = self.ThirdPerson and Vector3.zero or (CONFIG.Camera.CameraOffset + Vector3.new(0, drop, 0))
+	-- Both camera types keep the mouse locked (Evade: first person and shift-lock third person).
+	-- Roblox's camera caches the mode it last set and won't reapply it after anything else changes it,
+	-- so the lock is enforced here every frame; the settings panel frees it while open.
+	if not Shared.SettingsOpen and UserInputService.MouseBehavior ~= Enum.MouseBehavior.LockCenter then
+		UserInputService.MouseBehavior = Enum.MouseBehavior.LockCenter
+	end
 end
 
 -- CameraService.Update: FieldOfView = BaseFOV * product(adjusters). Written BEFORE the springs update the
@@ -3976,7 +3968,9 @@ function UI.BuildSettings(maid, parent)
 	local c = CONFIG.Camera
 	local gui = make("ScreenGui", { Name = "EvadeClone_Settings", ResetOnSpawn = false, Enabled = false, DisplayOrder = 10, ZIndexBehavior = Enum.ZIndexBehavior.Global })
 	local panel = make("TextButton", {
-		Name = "Panel", Text = "", AutoButtonColor = false, Modal = true, -- Modal frees the locked mouse
+		-- Modal frees the locked mouse.  It is only switched on while the panel is open: a Modal button
+		-- inside a disabled ScreenGui still kept the cursor unlocked, so third-person mouse look needed RMB.
+		Name = "Panel", Text = "", AutoButtonColor = false, Modal = false,
 		AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5), Size = UDim2.fromOffset(360, 150),
 		BackgroundColor3 = Color3.fromRGB(20, 20, 24), BackgroundTransparency = 0.1, BorderSizePixel = 0,
 	}, { corner(0, 12), make("UIStroke", { Color = Color3.fromRGB(255, 255, 255), Transparency = 0.85, Thickness = 1 }) })
@@ -4063,12 +4057,20 @@ function UI.ToggleSettings(open)
 	if open == nil then
 		open = not gui.Enabled
 	end
+	if open == gui.Enabled then
+		return
+	end
 	gui.Enabled = open
+	gui.Panel.Modal = open
 	Shared.SettingsOpen = open
 	if open then
+		-- Roblox's camera caches the mouse mode it last set and won't reapply it, so remember it here
+		-- and put it back on close (otherwise first person stays unlocked).
+		UI.MouseBehaviorBeforeSettings = UserInputService.MouseBehavior
 		UserInputService.MouseBehavior = Enum.MouseBehavior.Default
 		UI.RenderSettings()
 	else
+		UserInputService.MouseBehavior = UI.MouseBehaviorBeforeSettings or Enum.MouseBehavior.Default
 		UI.SaveSettings()
 	end
 end

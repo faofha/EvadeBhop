@@ -95,8 +95,9 @@ nothing depends on them. To hook the host game's own remotes, set these roles:
 
 ### Controls (Evade defaults)
 Jump `Space` / `ButtonA` (gamepad A held = auto-hop, as in Evade) · Crouch/slide hold `C` / `LeftControl` / `ButtonR2`
-· Third person `O` / `ButtonR3`, or scroll the mouse wheel out from first person (scroll in past 2 studs to
-return; the mouse turns the third-person camera directly, shift-lock style, no right-click needed)
+· Third person `O` / `ButtonR3`, or the mouse wheel: it has two fixed positions, as in Evade. Scrolling
+out goes to third person at 6 studs and stays there; scrolling in returns to first person. The mouse turns
+the third-person camera directly, shift-lock style, with no right-click needed
 · Settings (FOV slider 70–100, saved to `EvadeClone/settings.json`) `P` · Validation `F8` · Unload `End`.
 
 ### Gravity
