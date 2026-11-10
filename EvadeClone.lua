@@ -81,7 +81,7 @@ local CONFIG = {
 	-- when missing, so nobody has to download them by hand.  Set Enabled = false to use local files only.
 	AssetDownload = {
 		Enabled = true,
-		BaseUrl = "https://raw.githubusercontent.com/faofha/EvadeBhop/claude/exciting-planck-uv1gh1/Animations/",
+		BaseUrl = "https://raw.githubusercontent.com/faofha/EvadeBhop/main/Animations/",
 		Redownload = false, -- true = overwrite local copies on every run
 	},
 
