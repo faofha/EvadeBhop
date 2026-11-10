@@ -147,7 +147,14 @@ local CONFIG = {
 		FOVMin = 70,
 		FOVMax = 100,
 		-- Third person is a script-driven shift-lock camera: the mouse turns it without right-click.
-		-- Mouse wheel switches between the two fixed positions (first person / ThirdPersonZoom).
+		-- Mouse wheel (MEASURED Camera.TestThirdPerson): each notch adds 1 to a counter that drains at
+		-- 4/s; above 3 it toggles (scroll out -> third person, scroll in -> first person) and resets.
+		ScrollToggleThreshold = 3,
+		ScrollDecayRate = 4,
+		ThirdPersonRootOffset = 0.4, -- MEASURED: Camera/Types ThirdPerson RootOffset
+		-- First-person body visibility (MEASURED Character/Client/Visibility): "NoArms" shows legs + torso;
+		-- head, arms, root and accessories are hidden.  FOV above 90 hides everything ("None").
+		FirstPersonVisibility = "NoArms",
 		ZoomRate = 12, -- zoom smoothing (1/s)
 		MaxPitch = math.rad(80), -- MEASURED: MaxY/MinY +-80
 		GamepadLookSpeed = Vector2.new(4.5, 3), -- rad/s at full right-stick deflection
@@ -2525,13 +2532,49 @@ function CameraFX:ToggleThirdPerson()
 	self:ApplyCameraType(false)
 end
 
--- Mouse wheel, Evade-style: two fixed positions.  Scroll out in first person -> third person at the
--- fixed ThirdPersonZoom (further scrolling out stays there); scroll in in third person -> first person.
+-- Mouse wheel (MEASURED Camera.TestThirdPerson): two fixed positions.  Each notch adds 1 to
+-- ScrollAmt (drained at ScrollDecayRate/s in Update); once it passes the threshold it resets and
+-- toggles if the direction matches: scroll out (Z < 0) in first person -> third person at the fixed
+-- 6 studs, scroll in (Z > 0) in third person -> first person.
 function CameraFX:OnWheel(z)
+	self.ScrollAmt = (self.ScrollAmt or 0) + 1
+	if self.ScrollAmt <= CONFIG.Camera.ScrollToggleThreshold then
+		return
+	end
+	self.ScrollAmt = 0
 	if z < 0 and not self.ThirdPerson then
 		self:ToggleThirdPerson()
 	elseif z > 0 and self.ThirdPerson then
 		self:ToggleThirdPerson()
+	end
+end
+
+-- Evade Visibility.Types.Classic (MEASURED): limb names left visible per type.
+local FP_VISIBILITY = {
+	All = { "Left Arm", "Right Arm", "Left Leg", "Right Leg", "Head", "Torso", "HumanoidRootPart" },
+	NoArms = { "Left Leg", "Right Leg", "Torso" },
+	LeftArm = { "Left Leg", "Right Leg", "Torso", "Left Arm" },
+	BothArms = { "Left Leg", "Right Leg", "Torso", "Left Arm", "Right Arm" },
+	None = {},
+}
+
+-- First person: Evade decides limb visibility itself (Visibility.GetType / SetVisibility) instead of
+-- Roblox's distance fade, so the head and hats never show when looking down.  Runs after Roblox's
+-- camera each frame, so it wins over Roblox's TransparencyController.
+function CameraFX:ApplyFirstPersonVisibility()
+	local typeName = workspace.CurrentCamera.FieldOfView > 90 and "None" or CONFIG.Camera.FirstPersonVisibility
+	local visible = FP_VISIBILITY[typeName] or FP_VISIBILITY.NoArms
+	local char = self.Ctx.Character
+	for _, d in char:GetDescendants() do
+		local part = d:IsA("BasePart") and d or (d:IsA("Decal") and d.Parent) or nil
+		if part then
+			-- accessory handles are not direct children of the character -> always hidden (Accoutrement rule)
+			local show = part.Parent == char and table.find(visible, part.Name) ~= nil
+			local v = show and 0 or 1
+			if d.LocalTransparencyModifier ~= v then
+				d.LocalTransparencyModifier = v
+			end
+		end
 	end
 end
 
@@ -2562,11 +2605,17 @@ function CameraFX:UpdateThirdPerson(dt)
 	end
 	self.ZoomCurrent = lerp(self.ZoomCurrent, self.Zoom, math.min(dt * c.ZoomRate, 1))
 	local ctx = self.Ctx
-	local drop = (ctx.RootSize.Y - CONFIG.Hull.StandSize.Y * ctx.SizeScale) / 2
-	local focus = ctx.Root.Position + Vector3.new(0, 1.5 + drop, 0)
+	-- Evade's camera subject is its root box (the hull), so the focus is hull centre + 1.5.
+	local focus = ctx.Root.Position + Vector3.new(0, 1.5 + self:HullEyeDelta(), 0)
 	local rot = CFrame.fromOrientation(self.Pitch, self.Yaw, 0)
 	local pivot = CFrame.new(focus) * rot * CFrame.new(c.ThirdPersonShiftLockOffset * math.min(self.ZoomCurrent / c.ThirdPersonZoom, 1))
 	local desired = pivot * CFrame.new(0, 0, self.ZoomCurrent)
+	-- MEASURED Camera/Types ThirdPerson RootOffset 0.4: camera offset by TorsoRot.Transform.p * 0.4
+	local kp = ctx.Animator and ctx.Animator.KeyframePlayer
+	local torsoRot = kp and kp.TorsoRotPose
+	if torsoRot and torsoRot.Position.Magnitude <= 10 then
+		desired *= CFrame.new(torsoRot.Position * c.ThirdPersonRootOffset)
+	end
 	-- keep the camera out of walls
 	local params = RaycastParams.new()
 	params.FilterType = Enum.RaycastFilterType.Exclude
@@ -2586,14 +2635,20 @@ function CameraFX:UpdateThirdPerson(dt)
 	end
 end
 
--- Per-frame camera-type upkeep (Camera:Update): first-person eye offset + crouch eye height.
--- ESTIMATED adaptation: Evade's custom camera applies OriginOffset (0,0.21,0); here it goes into
--- Humanoid.CameraOffset, plus the emulated hull drop (rootY - 4) / 2.  Third person applies its own
--- offsets in UpdateThirdPerson.
+-- Height of Evade's camera subject (its root box = the hull, centred RootSize.Y/2 above the floor)
+-- relative to this rig's HumanoidRootPart.  Standing on stock R6: 2 - 3 = -1 stud.  Crouching lowers it.
+function CameraFX:HullEyeDelta()
+	local ctx = self.Ctx
+	return ctx.RootSize.Y / 2 - ctx.CenterToFloor
+end
+
+-- Per-frame camera-type upkeep (Camera:Update): first-person eye height.
+-- Evade: camera = root(hull centre) + 1.5 (Roblox head offset) + OriginOffset (0, 0.21, 0) (MEASURED),
+-- i.e. 3.71 studs above the floor standing.  Roblox's camera here starts from this rig's HRP, so the
+-- hull delta goes into Humanoid.CameraOffset.  Third person applies its own offsets in UpdateThirdPerson.
 function CameraFX:UpdateType()
 	local ctx = self.Ctx
-	local drop = (ctx.RootSize.Y - CONFIG.Hull.StandSize.Y * ctx.SizeScale) / 2
-	ctx.Humanoid.CameraOffset = self.ThirdPerson and Vector3.zero or (CONFIG.Camera.CameraOffset + Vector3.new(0, drop, 0))
+	ctx.Humanoid.CameraOffset = self.ThirdPerson and Vector3.zero or (CONFIG.Camera.CameraOffset + Vector3.new(0, self:HullEyeDelta(), 0))
 	-- Both camera types keep the mouse locked (Evade: first person and shift-lock third person).
 	-- Roblox's camera caches the mode it last set and won't reapply it after anything else changes it,
 	-- so the lock is enforced here every frame; the settings panel frees it while open.
@@ -2698,7 +2753,11 @@ end
 
 -- ToolProfile/ViewmodelVisuals.Update -> SetCameraOffset("Viewmodel") ; Reset() when hidden (3rd person).
 function CameraFX:Update(dt)
+	self.ScrollAmt = math.max((self.ScrollAmt or 0) - dt * CONFIG.Camera.ScrollDecayRate, 0)
 	self:WriteFOV()
+	if not self.ThirdPerson then
+		self:ApplyFirstPersonVisibility()
+	end
 	if self.ThirdPerson then
 		self.SprintFOV = lerp(self.SprintFOV, 1, math.min(dt * 6, 1))
 		self.Offset = CFrame.identity
@@ -3160,14 +3219,16 @@ function KeyframePlayer:SetupR6Retarget(character)
 	end
 	rig.TorsoRest = rig.RootJoint.C0 * rig.RootJoint.C1:Inverse()
 	rig.TorsoRestInv = rig.TorsoRest:Inverse()
-	-- pivots in torso space (a joint's C0 position is its pivot in Part0 space)
+	-- Pivots in torso space, MEASURED from Evade's rig (ReplicatedStorage/Assets/Character/R6): every joint
+	-- has identity-rotation C0/C1.  Neck (0,1,0), ArmRot (0,0.5,0) on TorsoRot, arms (+-1,0) on ArmRot,
+	-- hips (+-0.5,-1,0) on TorsoRot (stock R6 hips sit at +-1).
 	rig.Pivot = {
-		Head = rig.Neck.C0.Position,
-		["Left Arm"] = rig["Left Arm"].C0.Position,
-		["Right Arm"] = rig["Right Arm"].C0.Position,
-		["Left Leg"] = rig["Left Leg"].C0.Position,
-		["Right Leg"] = rig["Right Leg"].C0.Position,
-		ArmRot = Vector3.new(0, rig["Right Arm"].C0.Position.Y, 0), -- ESTIMATED: shoulder line
+		Head = Vector3.new(0, 1, 0),
+		["Left Arm"] = Vector3.new(-1, 0.5, 0),
+		["Right Arm"] = Vector3.new(1, 0.5, 0),
+		["Left Leg"] = Vector3.new(-0.5, -1, 0),
+		["Right Leg"] = Vector3.new(0.5, -1, 0),
+		ArmRot = Vector3.new(0, 0.5, 0),
 	}
 	self.R6 = rig
 end
@@ -3253,6 +3314,7 @@ function KeyframePlayer:Step(dt)
 	end
 	-- Evade rig forward kinematics in torso space (deltas from the rest pose).
 	local wTorsoRot = blend("TorsoRot")
+	self.TorsoRotPose = wTorsoRot -- third-person camera follows its translation (Evade RootOffset)
 	local wTorso = wTorsoRot * blend("Torso")
 	local wArmRot = wTorsoRot * about(rig.Pivot.ArmRot, blend("ArmRot"))
 	local delta = {
@@ -3765,106 +3827,104 @@ local function vGradient()
 end
 local GOTHAM_BOLD = Font.new("rbxasset://fonts/families/GothamSSm.json", Enum.FontWeight.Bold)
 
--- Native Evade layout (MEASURED properties from ReplicatedStorage/Assets/UI/Game).
+-- Native Evade layout: generated from Evade's place file (ReplicatedStorage/Assets/UI/Game/HUD/Overlay/
+-- CharacterStatus, Health + Speedometer subtrees; Tickets/Style/EventMachine/Attributes/VehicleHealth are
+-- game-only and left out).  Values are exact; properties at their class default are omitted, enums are
+-- stored as numbers.  Regenerate with tools/rbxl (see docs) instead of editing by hand.
+local EVADE_HUD = {
+	{ Path = "CharacterStatus", Class = "Frame", Props = { AnchorPoint=Vector2.new(0,1), BackgroundColor3=Color3.new(1,1,1), BackgroundTransparency=1, Position=UDim2.new(0,0,1,0), Size=UDim2.new(1,0,1,0) } },
+	{ Path = "CharacterStatus/BottomLeft", Class = "Frame", Props = { AnchorPoint=Vector2.new(0,1), BackgroundColor3=Color3.new(1,1,1), BackgroundTransparency=1, Position=UDim2.new(0,0,1,0), Size=UDim2.new(1,0,1,0) } },
+	{ Path = "CharacterStatus/UIAspectRatioConstraint", Class = "UIAspectRatioConstraint", Props = {} },
+	{ Path = "CharacterStatus/BottomLeft/Health", Class = "Frame", Props = { AnchorPoint=Vector2.new(0,1), BackgroundColor3=Color3.new(0,0,0), BackgroundTransparency=0.8, BorderSizePixel=0, Position=UDim2.new(0.05,0,0.95,0), Size=UDim2.new(0.25,0,0.1,0) } },
+	{ Path = "CharacterStatus/BottomLeft/Speedometer", Class = "Frame", Props = { BackgroundColor3=Color3.new(0,0,0), BackgroundTransparency=1, Position=UDim2.new(0.32,0,0.85,0), Size=UDim2.new(0.045,0,0.045,0), ZIndex=0 } },
+	{ Path = "CharacterStatus/BottomLeft/UISizeConstraint", Class = "UISizeConstraint", Props = { MaxSize=Vector2.new(600,600), MinSize=Vector2.new(420,420) } },
+	{ Path = "CharacterStatus/BottomLeft/Health/Background", Class = "ImageLabel", Props = { AnchorPoint=Vector2.new(0.5,0.5), BackgroundColor3=Color3.new(1,1,1), BackgroundTransparency=1, Image="rbxassetid://196969716", ImageColor3=Color3.new(0.0823529,0.0823529,0.0823529), ImageTransparency=0.8, Position=UDim2.new(0.5,0,0.5,0), Size=UDim2.new(1,0,1,0), ZIndex=0 } },
+	{ Path = "CharacterStatus/BottomLeft/Health/BackgroundStroke", Class = "Frame", Props = { AnchorPoint=Vector2.new(0.5,0.5), BackgroundColor3=Color3.new(1,1,1), BackgroundTransparency=1, BorderSizePixel=0, Position=UDim2.new(0.5,0,0.5,0), Size=UDim2.new(1,-6,1,-6) } },
+	{ Path = "CharacterStatus/BottomLeft/Health/Frame", Class = "Frame", Props = { AnchorPoint=Vector2.new(0,0.5), BackgroundColor3=Color3.new(1,1,1), BackgroundTransparency=1, Position=UDim2.new(0.775,0,0.6,0), Size=UDim2.new(0.225,0,0.45,0) } },
+	{ Path = "CharacterStatus/BottomLeft/Health/Health", Class = "TextLabel", Props = { AnchorPoint=Vector2.new(1,0.5), BackgroundColor3=Color3.new(1,1,1), BackgroundTransparency=1, FontFace={font="rbxasset://fonts/families/GothamSSm.json",w=700,s=0}, Position=UDim2.new(0.9,0,0.5,0), Size=UDim2.new(0.5,0,0.5,0), Text="100", TextColor3=Color3.new(0.439216,1,0.286275), TextScaled=true, TextSize=14, TextStrokeTransparency=0.95, TextWrapped=true } },
+	{ Path = "CharacterStatus/BottomLeft/Health/HealthIcon", Class = "ImageLabel", Props = { AnchorPoint=Vector2.new(0,0.5), BackgroundColor3=Color3.new(1,1,1), BackgroundTransparency=1, Image="rbxassetid://18788896053", ImageColor3=Color3.new(0.439216,1,0.286275), Position=UDim2.new(0.08,0,0.52072,0), Size=UDim2.new(0.256576,0,0.641441,0), ZIndex=4 } },
+	{ Path = "CharacterStatus/BottomLeft/Health/UICorner", Class = "UICorner", Props = { BottomLeftRadius=UDim.new(0.1,0), BottomRightRadius=UDim.new(0.1,0), TopLeftRadius=UDim.new(0.1,0), TopRightRadius=UDim.new(0.1,0) } },
+	{ Path = "CharacterStatus/BottomLeft/Health/UIShadow", Class = "UIShadow", Props = { BlurRadius=UDim.new(0.12,0), Transparency=0.6 } },
+	{ Path = "CharacterStatus/BottomLeft/Health/UIStroke", Class = "UIStroke", Props = { Transparency=0.8 } },
+	{ Path = "CharacterStatus/BottomLeft/Speedometer/Background", Class = "ImageLabel", Props = { AnchorPoint=Vector2.new(0.5,0.5), BackgroundColor3=Color3.new(1,1,1), BackgroundTransparency=1, Image="rbxassetid://196969716", ImageColor3=Color3.new(0.0823529,0.0823529,0.0823529), ImageTransparency=0.4, Position=UDim2.new(0.5,0,0.5,0), Size=UDim2.new(1.25,0,1.25,0) } },
+	{ Path = "CharacterStatus/BottomLeft/Speedometer/Frame", Class = "Frame", Props = { BackgroundColor3=Color3.new(0,0,0), BackgroundTransparency=1, ClipsDescendants=true, Size=UDim2.new(1,0,1,0) } },
+	{ Path = "CharacterStatus/BottomLeft/Speedometer/Front", Class = "Frame", Props = { BackgroundColor3=Color3.new(0,0,0), BackgroundTransparency=1, ClipsDescendants=true, Position=UDim2.new(1,0,0,0), Size=UDim2.new(2.6,0,1,0) } },
+	{ Path = "CharacterStatus/BottomLeft/Speedometer/ImageLabel", Class = "ImageLabel", Props = { AnchorPoint=Vector2.new(0.5,0.5), BackgroundColor3=Color3.new(1,1,1), BackgroundTransparency=1, Image="rbxassetid://13492318225", ImageColor3=Color3.new(1,0.854902,0.419608), Position=UDim2.new(0.5,0,0.5,0), Size=UDim2.new(0.75,0,0.75,0) } },
+	{ Path = "CharacterStatus/BottomLeft/Speedometer/Speed", Class = "TextLabel", Props = { AnchorPoint=Vector2.new(0,0.5), BackgroundColor3=Color3.new(1,1,1), BackgroundTransparency=1, FontFace={font="rbxasset://fonts/families/GothamSSm.json",w=700,s=0}, Position=UDim2.new(1.3,0,0.5,0), Size=UDim2.new(6,0,0.8,0), Text="0", TextColor3=Color3.new(1,0.854902,0.419608), TextScaled=true, TextSize=14, TextStrokeTransparency=0.9, TextWrapped=true, TextXAlignment=0, ZIndex=2 } },
+	{ Path = "CharacterStatus/BottomLeft/Speedometer/UIAspectRatioConstraint", Class = "UIAspectRatioConstraint", Props = {} },
+	{ Path = "CharacterStatus/BottomLeft/Speedometer/UICorner", Class = "UICorner", Props = { BottomLeftRadius=UDim.new(0,4), BottomRightRadius=UDim.new(0,4), TopLeftRadius=UDim.new(0,4), TopRightRadius=UDim.new(0,4) } },
+	{ Path = "CharacterStatus/BottomLeft/Health/Background/UICorner", Class = "UICorner", Props = { BottomLeftRadius=UDim.new(0,4), BottomRightRadius=UDim.new(0,4), TopLeftRadius=UDim.new(0,4), TopRightRadius=UDim.new(0,4) } },
+	{ Path = "CharacterStatus/BottomLeft/Health/BackgroundStroke/UICorner", Class = "UICorner", Props = { BottomLeftRadius=UDim.new(0.06,0), BottomRightRadius=UDim.new(0.06,0), TopLeftRadius=UDim.new(0.06,0), TopRightRadius=UDim.new(0.06,0) } },
+	{ Path = "CharacterStatus/BottomLeft/Health/BackgroundStroke/UIStroke", Class = "UIStroke", Props = { Color=Color3.new(0.439216,1,0.286275), Thickness=2, Transparency=0.7 } },
+	{ Path = "CharacterStatus/BottomLeft/Health/Frame/UIListLayout", Class = "UIListLayout", Props = { FillDirection=0, HorizontalAlignment=2, SortOrder=2, VerticalAlignment=0 } },
+	{ Path = "CharacterStatus/BottomLeft/Health/Health/UIGradient", Class = "UIGradient", Props = { Color=ColorSequence.new({ColorSequenceKeypoint.new(0,Color3.new(1,1,1)),ColorSequenceKeypoint.new(1,Color3.new(0.647059,0.647059,0.647059))}), Rotation=90, Transparency=NumberSequence.new({NumberSequenceKeypoint.new(0.00,0.00),NumberSequenceKeypoint.new(1.00,0.00)}) } },
+	{ Path = "CharacterStatus/BottomLeft/Health/Health/UIStroke", Class = "UIStroke", Props = { Thickness=2, Transparency=0.5 } },
+	{ Path = "CharacterStatus/BottomLeft/Health/HealthIcon/HealthIcon", Class = "ImageLabel", Props = { AnchorPoint=Vector2.new(0.5,0.5), BackgroundColor3=Color3.new(1,1,1), BackgroundTransparency=1, Image="rbxassetid://18788900977", ImageTransparency=0.5, Position=UDim2.new(0.5,0,0.5,0), Size=UDim2.new(1,0,1,0), ZIndex=3 } },
+	{ Path = "CharacterStatus/BottomLeft/Health/HealthIcon/UIAspectRatioConstraint", Class = "UIAspectRatioConstraint", Props = { AspectRatio=1.1 } },
+	{ Path = "CharacterStatus/BottomLeft/Health/HealthIcon/UIGradient", Class = "UIGradient", Props = { Color=ColorSequence.new({ColorSequenceKeypoint.new(0,Color3.new(1,1,1)),ColorSequenceKeypoint.new(1,Color3.new(0.647059,0.647059,0.647059))}), Rotation=90, Transparency=NumberSequence.new({NumberSequenceKeypoint.new(0.00,0.00),NumberSequenceKeypoint.new(1.00,0.00)}) } },
+	{ Path = "CharacterStatus/BottomLeft/Speedometer/Background/UICorner", Class = "UICorner", Props = { BottomLeftRadius=UDim.new(0,4), BottomRightRadius=UDim.new(0,4), TopLeftRadius=UDim.new(0,4), TopRightRadius=UDim.new(0,4) } },
+	{ Path = "CharacterStatus/BottomLeft/Speedometer/Frame/Frame", Class = "Frame", Props = { BackgroundColor3=Color3.new(0,0,0), BackgroundTransparency=0.6, Size=UDim2.new(2,0,1,0) } },
+	{ Path = "CharacterStatus/BottomLeft/Speedometer/Front/Frame", Class = "Frame", Props = { BackgroundColor3=Color3.new(0,0,0), BackgroundTransparency=0.9, Position=UDim2.new(-1,0,0,0), Size=UDim2.new(2,0,1,0) } },
+	{ Path = "CharacterStatus/BottomLeft/Speedometer/ImageLabel/UICorner", Class = "UICorner", Props = { BottomLeftRadius=UDim.new(0,3), BottomRightRadius=UDim.new(0,3), TopLeftRadius=UDim.new(0,3), TopRightRadius=UDim.new(0,3) } },
+	{ Path = "CharacterStatus/BottomLeft/Speedometer/ImageLabel/UIGradient", Class = "UIGradient", Props = { Color=ColorSequence.new({ColorSequenceKeypoint.new(0,Color3.new(1,1,1)),ColorSequenceKeypoint.new(1,Color3.new(1,0.772549,0.239216))}), Rotation=90, Transparency=NumberSequence.new({NumberSequenceKeypoint.new(0.00,0.00),NumberSequenceKeypoint.new(1.00,0.00)}) } },
+	{ Path = "CharacterStatus/BottomLeft/Speedometer/Speed/UIGradient", Class = "UIGradient", Props = { Color=ColorSequence.new({ColorSequenceKeypoint.new(0,Color3.new(1,1,1)),ColorSequenceKeypoint.new(1,Color3.new(1,0.772549,0.239216))}), Rotation=90, Transparency=NumberSequence.new({NumberSequenceKeypoint.new(0.00,0.00),NumberSequenceKeypoint.new(1.00,0.00)}) } },
+	{ Path = "CharacterStatus/BottomLeft/Speedometer/Speed/UIStroke", Class = "UIStroke", Props = { Thickness=2, Transparency=0.5 } },
+	{ Path = "CharacterStatus/BottomLeft/Speedometer/Frame/Frame/UICorner", Class = "UICorner", Props = { BottomLeftRadius=UDim.new(0,4), BottomRightRadius=UDim.new(0,4), TopLeftRadius=UDim.new(0,4), TopRightRadius=UDim.new(0,4) } },
+	{ Path = "CharacterStatus/BottomLeft/Speedometer/Front/Frame/UICorner", Class = "UICorner", Props = { BottomLeftRadius=UDim.new(0,4), BottomRightRadius=UDim.new(0,4), TopLeftRadius=UDim.new(0,4), TopRightRadius=UDim.new(0,4) } },
+}
+
+local function enumFromValue(enumType, value)
+	for _, item in enumType:GetEnumItems() do
+		if item.Value == value then
+			return item
+		end
+	end
+	return nil
+end
+
+local function applyProp(inst, key, value)
+	if type(value) == "table" and value.font then
+		value = Font.new(value.font, enumFromValue(Enum.FontWeight, value.w) or Enum.FontWeight.Regular, enumFromValue(Enum.FontStyle, value.s) or Enum.FontStyle.Normal)
+	elseif type(value) == "number" then
+		local ok, cur = pcall(function()
+			return inst[key]
+		end)
+		if ok and typeof(cur) == "EnumItem" then
+			value = enumFromValue(cur.EnumType, value)
+			if value == nil then
+				return
+			end
+		end
+	end
+	pcall(function()
+		inst[key] = value
+	end)
+end
+
 function UI.BuildNative()
+	-- ScreenGui "Game" -> HUD -> Overlay (MEASURED: ScreenInsets CoreUISafeInsets, ZIndexBehavior Global)
 	local gui = make("ScreenGui", {
 		Name = "EvadeClone_Game", ResetOnSpawn = false,
 		ScreenInsets = Enum.ScreenInsets.CoreUISafeInsets, ClipToDeviceSafeArea = true,
 		ZIndexBehavior = Enum.ZIndexBehavior.Global, DisplayOrder = 0,
 	})
-	local full = { BackgroundTransparency = 1, BorderSizePixel = 0, Size = UDim2.fromScale(1, 1) }
-	local function fullFrame(name, anchorBottom)
-		local p = table.clone(full)
-		p.Name = name
-		if anchorBottom then
-			p.AnchorPoint = Vector2.new(0, 1)
-			p.Position = UDim2.fromScale(0, 1)
-		end
-		return make("Frame", p)
-	end
-	local hud = fullFrame("HUD")
+	local hud = make("Frame", { Name = "HUD", BackgroundTransparency = 1, BorderSizePixel = 0, Size = UDim2.fromScale(1, 1) })
 	hud.Parent = gui
-	local overlay = fullFrame("Overlay")
+	local overlay = make("Frame", { Name = "Overlay", BackgroundTransparency = 1, BorderSizePixel = 0, Size = UDim2.fromScale(1, 1) })
 	overlay.Parent = hud
-	local status = fullFrame("CharacterStatus", true)
-	status.Parent = overlay
-	local bottomLeft = fullFrame("BottomLeft", true)
-	bottomLeft.Parent = status
-
-	-- Speedometer
-	local speedometer = make("Frame", {
-		Name = "Speedometer", BackgroundColor3 = Color3.new(0, 0, 0), BackgroundTransparency = 1,
-		Position = UDim2.new(0.32, 0, 0.85, 0), Size = UDim2.new(0.045, 0, 0.045, 0), ZIndex = 0,
-	}, {
-		make("UIAspectRatioConstraint", { AspectRatio = 1 }),
-		corner(0, 4),
-		make("ImageLabel", {
-			Name = "Background", AnchorPoint = Vector2.new(0.5, 0.5), BackgroundTransparency = 1,
-			Position = UDim2.fromScale(0.5, 0.5), Size = UDim2.fromScale(1.25, 1.25),
-			Image = "rbxassetid://196969716", ImageColor3 = Color3.fromRGB(21, 21, 21), ImageTransparency = 0.4, ZIndex = 1,
-		}, { corner(0, 4) }),
-		make("Frame", { Name = "Frame", BackgroundTransparency = 1, Size = UDim2.fromScale(1, 1) }, {
-			make("Frame", { Name = "Frame", BackgroundColor3 = Color3.new(0, 0, 0), BackgroundTransparency = 0.6, BorderSizePixel = 0, Size = UDim2.new(2, 0, 1, 0) }, { corner(0, 4) }),
-		}),
-		make("Frame", { Name = "Front", BackgroundTransparency = 1, Position = UDim2.new(1, 0, 0, 0), Size = UDim2.new(2.6, 0, 1, 0) }, {
-			make("Frame", { Name = "Frame", BackgroundColor3 = Color3.new(0, 0, 0), BackgroundTransparency = 0.9, BorderSizePixel = 0, Position = UDim2.new(-1, 0, 0, 0), Size = UDim2.new(2, 0, 1, 0) }, { corner(0, 4) }),
-		}),
-		make("ImageLabel", {
-			Name = "ImageLabel", AnchorPoint = Vector2.new(0.5, 0.5), BackgroundTransparency = 1,
-			Position = UDim2.fromScale(0.5, 0.5), Size = UDim2.fromScale(0.75, 0.75),
-			Image = "rbxassetid://13492318225", ImageColor3 = Color3.fromRGB(255, 218, 107), ZIndex = 1,
-		}, { corner(0, 3), vGradient() }),
-		make("TextLabel", {
-			Name = "Speed", AnchorPoint = Vector2.new(0, 0.5), BackgroundTransparency = 1,
-			Position = UDim2.new(1.3, 0, 0.5, 0), Size = UDim2.new(6, 0, 0.8, 0), FontFace = GOTHAM_BOLD,
-			Text = "0", TextColor3 = Color3.fromRGB(255, 218, 107), TextScaled = true, TextSize = 14,
-			TextStrokeColor3 = Color3.new(0, 0, 0), TextStrokeTransparency = 0.9,
-			TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Center, ZIndex = 2,
-		}, { vGradient(), make("UIStroke", { Color = Color3.new(0, 0, 0), Thickness = 2, Transparency = 0.5 }) }),
-	})
-	speedometer.Parent = bottomLeft
-
-	-- Health
-	local green = Color3.fromRGB(112, 255, 73)
-	local health = make("Frame", {
-		Name = "Health", AnchorPoint = Vector2.new(0, 1), BackgroundColor3 = Color3.new(0, 0, 0), BackgroundTransparency = 0.8,
-		BorderSizePixel = 0, Position = UDim2.new(0.05, 0, 0.95, 0), Size = UDim2.new(0.25, 0, 0.1, 0),
-	}, {
-		corner(0.1, 0),
-		make("UIStroke", { Color = Color3.new(0, 0, 0), Thickness = 1, Transparency = 0.8 }),
-		make("ImageLabel", {
-			Name = "Background", AnchorPoint = Vector2.new(0.5, 0.5), BackgroundTransparency = 1,
-			Position = UDim2.fromScale(0.5, 0.5), Size = UDim2.fromScale(1, 1), Image = "rbxassetid://196969716",
-			ImageColor3 = Color3.fromRGB(21, 21, 21), ImageTransparency = 0.8, ZIndex = 0,
-		}, { corner(0, 4) }),
-		make("Frame", { Name = "BackgroundStroke", AnchorPoint = Vector2.new(0.5, 0.5), BackgroundTransparency = 1, BorderSizePixel = 0, Position = UDim2.fromScale(0.5, 0.5), Size = UDim2.new(1, -6, 1, -6) }, {
-			corner(0.06, 0),
-			make("UIStroke", { Color = green, Thickness = 2, Transparency = 0.7 }),
-		}),
-		make("Frame", { Name = "Frame", AnchorPoint = Vector2.new(0, 0.5), BackgroundTransparency = 1, Position = UDim2.new(0.775, 0, 0.6, 0), Size = UDim2.new(0.225, 0, 0.45, 0) }, {
-			make("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, HorizontalAlignment = Enum.HorizontalAlignment.Right, SortOrder = Enum.SortOrder.LayoutOrder }),
-		}),
-		make("ImageLabel", {
-			Name = "HealthIcon", AnchorPoint = Vector2.new(0, 0.5), BackgroundTransparency = 1,
-			Position = UDim2.new(0.08, 0, 0.5207, 0), Size = UDim2.new(0.2566, 0, 0.6414, 0), Image = "rbxassetid://18788896053",
-			ImageColor3 = green, ZIndex = 4,
-		}, {
-			make("UIAspectRatioConstraint", { AspectRatio = 1.1 }),
-			vGradient(),
-			make("ImageLabel", { Name = "HealthIcon", AnchorPoint = Vector2.new(0.5, 0.5), BackgroundTransparency = 1, Position = UDim2.fromScale(0.5, 0.5), Size = UDim2.fromScale(1, 1), Image = "rbxassetid://18788900977", ImageTransparency = 0.5, ZIndex = 3 }),
-		}),
-		make("TextLabel", {
-			Name = "Health", AnchorPoint = Vector2.new(1, 0.5), BackgroundTransparency = 1, Position = UDim2.new(0.9, 0, 0.5, 0),
-			Size = UDim2.new(0.5, 0, 0.5, 0), FontFace = GOTHAM_BOLD, Text = "100", TextColor3 = green, TextScaled = true, TextSize = 14,
-			TextStrokeColor3 = Color3.new(0, 0, 0), TextStrokeTransparency = 0.95, TextXAlignment = Enum.TextXAlignment.Center,
-			TextYAlignment = Enum.TextYAlignment.Center, ZIndex = 1,
-		}, { vGradient(), make("UIStroke", { Color = Color3.new(0, 0, 0), Thickness = 2, Transparency = 0.5 }) }),
-	})
-	-- UIShadow is a newer instance; created only if the client supports it.
-	pcall(function()
-		make("UIShadow", { BlurRadius = UDim.new(0.12, 0), Color = Color3.new(0, 0, 0), Transparency = 0.6 }).Parent = health
-	end)
-	health.Parent = bottomLeft
+	local byPath = {}
+	for _, row in EVADE_HUD do
+		local ok, inst = pcall(Instance.new, row.Class)
+		if ok and inst then
+			local parentPath, name = string.match(row.Path, "^(.*)/([^/]+)$")
+			inst.Name = name or row.Path
+			for key, value in row.Props do
+				applyProp(inst, key, value)
+			end
+			inst.Parent = parentPath and byPath[parentPath] or overlay
+			byPath[row.Path] = inst
+		end
+	end
 	return gui
 end
 

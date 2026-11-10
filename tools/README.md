@@ -9,6 +9,17 @@
 
 Run with `python3 -I` and keep downloaded place files in their own folder.
 
+### Without Python (Windows: Git for Windows + the executor)
+- `unpack_rbxl.pl <place.rbxl> <workdir> <out.rbxl>`: writes a copy of the place with every chunk
+  uncompressed. Run it with Git's Perl (`"C:\Program Files\Git\usr\bin\perl.exe"`). Perl walks the chunk
+  structure, and Windows `tar` (libarchive with libzstd) decompresses all the zstd chunks in one pass.
+  Each chunk is wrapped as a tar entry inside a zstd stream built from hand-made raw frames.
+- `rbxl_reader.luau`: run it in the executor on the uncompressed copy (saved as
+  `EvadeCloneDev/evade_raw.rbxl` in the workspace). It installs `getgenv().RBXL` with:
+  `find(pattern)` (instance paths), `props(path, withDescendants)`, `source(path)` (script source), and
+  `export(path)` (Luau constructor rows with non-default properties only). The `EVADE_HUD` table in
+  `EvadeClone.lua` was generated with `export("ReplicatedStorage/Assets/UI/Game/HUD/Overlay/CharacterStatus")`.
+
 ## `mocktest/`: headless mechanics test
 `./tools/mocktest/run.sh` concatenates `mock.lua` (minimal Roblox API mock: flat floor at Y=0,
 LinearVelocity integration, gravity, Humanoid jump, raycasts, in-memory executor file system) +
