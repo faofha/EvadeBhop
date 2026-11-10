@@ -178,6 +178,7 @@ local CONFIG = {
 		-- head, arms, root and accessories are hidden.  FOV above 90 hides everything ("None").
 		FirstPersonVisibility = "NoArms",
 		POVScroll = true, -- MEASURED Config/Player/Settings POVScroll default true (settings menu)
+		HighFOVBody = false, -- custom: true keeps legs + torso visible above FOV 90 (Evade hides them)
 		TouchLookSpeed = Vector2.new(1, 0.66) * math.rad(1), -- Roblox CameraInput ROTATION_SPEED_TOUCH, rad per pixel
 		ZoomRate = 12, -- zoom smoothing (1/s)
 		MaxPitch = math.rad(80), -- MEASURED: MaxY/MinY +-80
@@ -2639,7 +2640,8 @@ local FP_VISIBILITY = {
 -- Roblox's distance fade, so the head and hats never show when looking down.  Runs after Roblox's
 -- camera each frame, so it wins over Roblox's TransparencyController.
 function CameraFX:ApplyFirstPersonVisibility()
-	local typeName = workspace.CurrentCamera.FieldOfView > 90 and "None" or CONFIG.Camera.FirstPersonVisibility
+	local hideForFOV = workspace.CurrentCamera.FieldOfView > 90 and not CONFIG.Camera.HighFOVBody
+	local typeName = hideForFOV and "None" or CONFIG.Camera.FirstPersonVisibility
 	local visible = FP_VISIBILITY[typeName] or FP_VISIBILITY.NoArms
 	local char = self.Ctx.Character
 	for _, d in char:GetDescendants() do
@@ -4244,6 +4246,8 @@ local SETTING_ROWS = {
 	{ Type = "Viewbob", Name = "Viewbob", Icon = "rbxassetid://13085201731", Desc = "Determines if your camera moves", Kind = "boolean" },
 	{ Type = "FOV", Name = "Field of View", Icon = "rbxassetid://14333878755", Kind = "number", Min = 70, Max = 100 },
 	{ Type = "POVScroll", Name = "POV Scroll", Icon = "rbxassetid://8677931999", Desc = "Determines if the scroll wheel changes POV", Kind = "boolean" },
+	-- Custom (not in Evade): Evade hides the whole first-person body above FOV 90.
+	{ Type = "HighFOVBody", Name = "High FOV Body", Icon = "rbxassetid://11660911888", Desc = "Shows your legs and torso even above 90 FOV", Kind = "boolean" },
 }
 local GAME_TAB_ICON = "rbxassetid://302250236" -- MEASURED Views/Settings "Game" header icon
 
@@ -4254,6 +4258,8 @@ local function getSetting(kind)
 		return CONFIG.Camera.Viewbob
 	elseif kind == "POVScroll" then
 		return CONFIG.Camera.POVScroll
+	elseif kind == "HighFOVBody" then
+		return CONFIG.Camera.HighFOVBody
 	end
 end
 
@@ -4264,6 +4270,8 @@ local function setSetting(kind, value)
 		CONFIG.Camera.Viewbob = value == true
 	elseif kind == "POVScroll" then
 		CONFIG.Camera.POVScroll = value == true
+	elseif kind == "HighFOVBody" then
+		CONFIG.Camera.HighFOVBody = value == true
 	end
 	UI.SaveSettings()
 end
@@ -4288,11 +4296,14 @@ function UI.LoadSettings()
 	if type(data.POVScroll) == "boolean" then
 		CONFIG.Camera.POVScroll = data.POVScroll
 	end
+	if type(data.HighFOVBody) == "boolean" then
+		CONFIG.Camera.HighFOVBody = data.HighFOVBody
+	end
 end
 
 function UI.SaveSettings()
 	local ok, text = pcall(function()
-		return HttpService:JSONEncode({ FOV = CONFIG.Camera.BaseFOV, Viewbob = CONFIG.Camera.Viewbob, POVScroll = CONFIG.Camera.POVScroll })
+		return HttpService:JSONEncode({ FOV = CONFIG.Camera.BaseFOV, Viewbob = CONFIG.Camera.Viewbob, POVScroll = CONFIG.Camera.POVScroll, HighFOVBody = CONFIG.Camera.HighFOVBody })
 	end)
 	if ok then
 		Assets.WriteFile(Assets.Path(SETTINGS_FILE), text)

@@ -110,6 +110,8 @@ outside Evade:
 - **Field of View:** a slider from 70 to 100 (default 70). The value is
   `floor(min + (max − min) · floor(pct·100)/100)`, and it applies when you release.
 - **POV Scroll:** a toggle for whether the scroll wheel switches POV (default on).
+- **High FOV Body:** a custom toggle, not in Evade, off by default. Evade hides the whole first-person
+  body above FOV 90; with this on, the legs and torso stay visible at any FOV.
 
 Values are saved to `EvadeClone/settings.json`. The other Evade settings (volumes, graphics,
 carrying, Legacy Camera, Sprint Viewmodel) control systems that only exist in Evade, so they aren't
