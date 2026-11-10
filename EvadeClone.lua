@@ -43,13 +43,35 @@ local VERSION = "1.0.0"
 --==============================================================================
 -- SECTION 0 : SERVICES, GLOBAL ENV, SINGLE-INSTANCE GUARD
 --==============================================================================
-local Players = game:GetService("Players")
-local RunService = game:GetService("RunService")
-local UserInputService = game:GetService("UserInputService")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local TweenService = game:GetService("TweenService")
-local Debris = game:GetService("Debris")
+-- Services go through cloneref when the executor has it, so the game's scripts can't detect this script
+-- through the shared service references.  Without it the plain service is used.
+local cloneRef = (typeof(cloneref) == "function" and cloneref) or (typeof(clonereference) == "function" and clonereference) or nil
+local function getService(name)
+	local service = game:GetService(name)
+	if cloneRef then
+		local ok, ref = pcall(cloneRef, service)
+		if ok and typeof(ref) == "Instance" then
+			return ref
+		end
+	end
+	return service
+end
+
+local Players = getService("Players")
+local RunService = getService("RunService")
+local UserInputService = getService("UserInputService")
+local ReplicatedStorage = getService("ReplicatedStorage")
+local TweenService = getService("TweenService")
+local Debris = getService("Debris")
+local HttpService = getService("HttpService")
 local LocalPlayer = Players.LocalPlayer
+
+-- Random instance names (32 hex chars, new each run) for everything this script creates, so the GUIs and
+-- the constraints/sounds on the character can't be found by a fixed name.
+local function hiddenName()
+	return (string.gsub(HttpService:GenerateGUID(false), "-", ""))
+end
+local PRECAMERA_BIND, CHARACTER_BIND = hiddenName(), hiddenName() -- RenderStep binding names
 
 -- Executor global table (falls back to _G so the guard still works without getgenv).
 local GENV = _G
@@ -1142,7 +1164,7 @@ do
 end
 do
 	local ok, ksp = pcall(function()
-		return game:GetService("KeyframeSequenceProvider")
+		return getService("KeyframeSequenceProvider")
 	end)
 	Cap.KeyframeSequenceProvider = ok and ksp or nil
 end
@@ -1282,7 +1304,7 @@ function Assets.LoadObjects(path)
 		end
 		if not objects then
 			local ok, res = pcall(function()
-				return game:GetService("InsertService"):LoadLocalAsset(id)
+				return getService("InsertService"):LoadLocalAsset(id)
 			end)
 			if ok and typeof(res) == "Instance" then
 				objects = { res }
@@ -1704,13 +1726,13 @@ function Movement:Init(maid)
 	end)
 
 	local att = Instance.new("Attachment")
-	att.Name = "EvadeClone_Center"
+	att.Name = hiddenName()
 	att.Parent = root
 	maid:Give(att)
 
 	-- BaseMover: LinearVelocity, Plane mode, X/Z tangents, MaxForce 100000 (MEASURED Constraints.Init).
 	local lv = Instance.new("LinearVelocity")
-	lv.Name = "EvadeClone_BaseMover"
+	lv.Name = hiddenName()
 	lv.Attachment0 = att
 	lv.MaxForce = self.Stats.LinearVelocityMaxForce
 	lv.VelocityConstraintMode = Enum.VelocityConstraintMode.Plane
@@ -1724,7 +1746,7 @@ function Movement:Init(maid)
 
 	-- WallrunForce: VectorForce, world-relative (MEASURED).
 	local vf = Instance.new("VectorForce")
-	vf.Name = "EvadeClone_WallrunForce"
+	vf.Name = hiddenName()
 	vf.Attachment0 = att
 	vf.RelativeTo = Enum.ActuatorRelativeTo.World
 	vf.Force = Vector3.zero
@@ -1734,7 +1756,7 @@ function Movement:Init(maid)
 
 	-- GravityComp: lifts the character by (game gravity - Evade gravity) so it falls like in Evade.
 	local gc = Instance.new("VectorForce")
-	gc.Name = "EvadeClone_GravityComp"
+	gc.Name = hiddenName()
 	gc.Attachment0 = att
 	gc.RelativeTo = Enum.ActuatorRelativeTo.World
 	gc.ApplyAtCenterOfMass = true
@@ -2822,13 +2844,13 @@ function Footsteps:Init(maid, overrides)
 	-- ESTIMATED positions (Evade's attachment CFrames are not decodable from the dump): HeadPos ~ head
 	-- height, SoundPos at hull centre, Slide at the feet.  Verify by ear; positions only affect 3D panning.
 	local floorOffset = -self.Ctx.CenterToFloor
-	self.HeadPos = attachment("EvadeClone_HeadPos", Vector3.new(0, floorOffset + 3.5, 0))
-	self.SoundPos = attachment("EvadeClone_SoundPos", Vector3.new(0, floorOffset + 2, 0))
-	self.SlideAttachment = attachment("EvadeClone_Slide", Vector3.new(0, floorOffset, 0))
+	self.HeadPos = attachment(hiddenName(), Vector3.new(0, floorOffset + 3.5, 0))
+	self.SoundPos = attachment(hiddenName(), Vector3.new(0, floorOffset + 2, 0))
+	self.SlideAttachment = attachment(hiddenName(), Vector3.new(0, floorOffset, 0))
 
 	if CONFIG.Audio.Whoosh then
 		local w = Instance.new("Sound")
-		w.Name = "EvadeClone_Whoosh"
+		w.Name = hiddenName()
 		for k, v in EVADE.Sounds.Whoosh do
 			w[k] = v
 		end
@@ -2840,7 +2862,7 @@ function Footsteps:Init(maid, overrides)
 	end
 	if CONFIG.Audio.Slide then
 		local s = Instance.new("Sound")
-		s.Name = "EvadeClone_SlideSound"
+		s.Name = hiddenName()
 		for k, v in EVADE.Sounds.Slide do
 			s[k] = v
 		end
@@ -2848,7 +2870,7 @@ function Footsteps:Init(maid, overrides)
 		s.Parent = self.SlideAttachment
 		self.SlideSound = s
 		local pe = Instance.new("ParticleEmitter")
-		pe.Name = "EvadeClone_SlideParticles"
+		pe.Name = hiddenName()
 		for k, v in EVADE.SlideParticles do
 			if k ~= "ActiveRate" then
 				pe[k] = v
@@ -3799,7 +3821,7 @@ local function guiParent(gui)
 		pcall(Cap.protect_gui, gui)
 	end
 	local ok = pcall(function()
-		gui.Parent = game:GetService("CoreGui")
+		gui.Parent = getService("CoreGui")
 	end)
 	if ok and gui.Parent then
 		return gui.Parent, Cap.protect_gui and "protect_gui+CoreGui" or "CoreGui"
@@ -3904,7 +3926,7 @@ end
 function UI.BuildNative()
 	-- ScreenGui "Game" -> HUD -> Overlay (MEASURED: ScreenInsets CoreUISafeInsets, ZIndexBehavior Global)
 	local gui = make("ScreenGui", {
-		Name = "EvadeClone_Game", ResetOnSpawn = false,
+		Name = hiddenName(), ResetOnSpawn = false,
 		ScreenInsets = Enum.ScreenInsets.CoreUISafeInsets, ClipToDeviceSafeArea = true,
 		ZIndexBehavior = Enum.ZIndexBehavior.Global, DisplayOrder = 0,
 	})
@@ -3949,7 +3971,7 @@ function UI.LoadCustom()
 				if root:IsA("ScreenGui") then
 					return root
 				end
-				local gui = make("ScreenGui", { Name = "EvadeClone_Game", ResetOnSpawn = false, ScreenInsets = Enum.ScreenInsets.CoreUISafeInsets, ClipToDeviceSafeArea = true, ZIndexBehavior = Enum.ZIndexBehavior.Global })
+				local gui = make("ScreenGui", { Name = hiddenName(), ResetOnSpawn = false, ScreenInsets = Enum.ScreenInsets.CoreUISafeInsets, ClipToDeviceSafeArea = true, ZIndexBehavior = Enum.ZIndexBehavior.Global })
 				for _, o in objects do
 					o.Parent = gui
 				end
@@ -3977,7 +3999,7 @@ function UI.Init(maid)
 		gui = UI.BuildNative()
 		source = "native Evade layout"
 	end
-	gui.Name = "EvadeClone_Game"
+	gui.Name = hiddenName()
 	local parent, how = guiParent(gui)
 	gui.Parent = parent
 	maid:Give(gui)
@@ -4008,7 +4030,7 @@ function UI.LoadSettings()
 		return
 	end
 	local ok, data = pcall(function()
-		return game:GetService("HttpService"):JSONDecode(text)
+		return getService("HttpService"):JSONDecode(text)
 	end)
 	if ok and type(data) == "table" and tonumber(data.FOV) then
 		CONFIG.Camera.BaseFOV = clamp(tonumber(data.FOV), CONFIG.Camera.FOVMin, CONFIG.Camera.FOVMax)
@@ -4017,7 +4039,7 @@ end
 
 function UI.SaveSettings()
 	local ok, text = pcall(function()
-		return game:GetService("HttpService"):JSONEncode({ FOV = CONFIG.Camera.BaseFOV })
+		return getService("HttpService"):JSONEncode({ FOV = CONFIG.Camera.BaseFOV })
 	end)
 	if ok then
 		Assets.WriteFile(Assets.Path(SETTINGS_FILE), text)
@@ -4026,7 +4048,7 @@ end
 
 function UI.BuildSettings(maid, parent)
 	local c = CONFIG.Camera
-	local gui = make("ScreenGui", { Name = "EvadeClone_Settings", ResetOnSpawn = false, Enabled = false, DisplayOrder = 10, ZIndexBehavior = Enum.ZIndexBehavior.Global })
+	local gui = make("ScreenGui", { Name = hiddenName(), ResetOnSpawn = false, Enabled = false, DisplayOrder = 10, ZIndexBehavior = Enum.ZIndexBehavior.Global })
 	local panel = make("TextButton", {
 		-- Modal frees the locked mouse.  It is only switched on while the panel is open: a Modal button
 		-- inside a disabled ScreenGui still kept the cursor unlocked, so third-person mouse look needed RMB.
@@ -4795,8 +4817,8 @@ end
 
 local function unload()
 	Validation.Stop()
-	pcall(RunService.UnbindFromRenderStep, RunService, "EvadeClone_PreCamera")
-	pcall(RunService.UnbindFromRenderStep, RunService, "EvadeClone_Character")
+	pcall(RunService.UnbindFromRenderStep, RunService, PRECAMERA_BIND)
+	pcall(RunService.UnbindFromRenderStep, RunService, CHARACTER_BIND)
 	teardownCharacter()
 	App.Maid:Clean()
 	if GENV.EvadeClone and GENV.EvadeClone.Unload == unload then
@@ -4825,13 +4847,13 @@ local function main()
 
 	if CONFIG.Mode == "CLONE" then
 		UI.Init(App.Maid)
-		RunService:BindToRenderStep("EvadeClone_PreCamera", Enum.RenderPriority.First.Value, function()
+		RunService:BindToRenderStep(PRECAMERA_BIND, Enum.RenderPriority.First.Value, function()
 			local c = App.Current
 			if c then
 				c:PreCamera()
 			end
 		end)
-		RunService:BindToRenderStep("EvadeClone_Character", Enum.RenderPriority.Camera.Value + 1, function(dt)
+		RunService:BindToRenderStep(CHARACTER_BIND, Enum.RenderPriority.Camera.Value + 1, function(dt)
 			local c = App.Current
 			if c then
 				local ok, err = pcall(c.Update, c, dt)

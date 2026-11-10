@@ -101,6 +101,15 @@ switch back to first person. (Evade's counter adds 1 per notch, drains at 4/s an
 mouse turns the third-person camera directly, shift-lock style, with no right-click needed
 · Settings (FOV slider 70–100, saved to `EvadeClone/settings.json`) `P` · Validation `F8` · Unload `End`.
 
+### Executor hygiene
+- **Services:** every service comes through `cloneref` (or `clonereference`), with the plain service as
+  the fallback when the executor has neither.
+- **UI placement:** the HUD and settings panel go into `gethui()`. If that's missing, the script uses
+  `protect_gui` + CoreGui, and PlayerGui as the last resort.
+- **Instance names:** everything the script creates gets a random 32-character name each run: both
+  ScreenGuis, the constraints, attachments, sounds and particles on the character, and the RenderStep
+  bindings. Nothing can be found by a fixed `EvadeClone_*` name.
+
 ### First-person camera and body (from Evade's place file)
 - **Eye height:** Evade's camera follows its 2×4×2 root box, so the eye sits at root centre + 1.5 + 0.21,
   which is 3.71 studs above the floor when standing. On a stock R6 rig the root sits 1 stud higher, so the
