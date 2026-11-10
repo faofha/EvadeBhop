@@ -95,10 +95,21 @@ nothing depends on them. To hook the host game's own remotes, set these roles:
 
 ### Controls (Evade defaults)
 Jump `Space` / `ButtonA` (gamepad A held = auto-hop, as in Evade) · Crouch/slide hold `C` / `LeftControl` / `ButtonR2`
-· Third person `O` / `ButtonR3`, or the mouse wheel: it has two fixed positions, as in Evade. Scrolling
-out goes to third person at 6 studs and stays there; scrolling in returns to first person. The mouse turns
-the third-person camera directly, shift-lock style, with no right-click needed
+· Third person `O` / `ButtonR3`, or the mouse wheel, which has two fixed positions as in Evade. Four quick
+notches out switch to third person at 6 studs, and scrolling further stays there. Four quick notches in
+switch back to first person. (Evade's counter adds 1 per notch, drains at 4/s and toggles above 3.) The
+mouse turns the third-person camera directly, shift-lock style, with no right-click needed
 · Settings (FOV slider 70–100, saved to `EvadeClone/settings.json`) `P` · Validation `F8` · Unload `End`.
+
+### First-person camera and body (from Evade's place file)
+- **Eye height:** Evade's camera follows its 2×4×2 root box, so the eye sits at root centre + 1.5 + 0.21,
+  which is 3.71 studs above the floor when standing. On a stock R6 rig the root sits 1 stud higher, so the
+  script lowers `Humanoid.CameraOffset` by that difference.
+- **Visibility:** Evade's `Character/Client/Visibility` hides the head, face, arms, root and every
+  accessory in first person. It shows only the torso and legs ("NoArms"), and above FOV 90 it hides the
+  whole body. `CONFIG.Camera.FirstPersonVisibility` selects the type.
+- **HUD:** the speedometer and health panel are generated from Evade's `CharacterStatus` UI and include
+  its size constraints and clipping (`tools/rbxl/rbxl_reader.luau`, `export`).
 
 ### Gravity
 Evade runs at `workspace.Gravity = 50`. Most games use 196.2, which shortened airtime to about 0.44 s.
