@@ -99,7 +99,33 @@ Jump `Space` / `ButtonA` (gamepad A held = auto-hop, as in Evade) · Crouch/slid
 notches out switch to third person at 6 studs, and scrolling further stays there. Four quick notches in
 switch back to first person. (Evade's counter adds 1 per notch, drains at 4/s and toggles above 3.) The
 mouse turns the third-person camera directly, shift-lock style, with no right-click needed
-· Settings (FOV slider 70–100, saved to `EvadeClone/settings.json`) `P` · Validation `F8` · Unload `End`.
+· Settings `P` (Evade's own settings key) · Validation `F8` · Unload `End`.
+
+### Settings menu
+`P` opens Evade's settings view, built from its place-file templates (`Menu/Views/Settings` plus the
+`Slider`, `Boolean`, `TopButton` and `TopExit` assets) and driven like Evade's `Views/Settings` module.
+It has a GAME tab with exit, and three rows taken from Evade's Game list, which are the ones that work
+outside Evade:
+- **Viewbob:** a toggle for camera bob and roll (default on).
+- **Field of View:** a slider from 70 to 100 (default 70). The value is
+  `floor(min + (max − min) · floor(pct·100)/100)`, and it applies when you release.
+- **POV Scroll:** a toggle for whether the scroll wheel switches POV (default on).
+
+Values are saved to `EvadeClone/settings.json`. The other Evade settings (volumes, graphics,
+carrying, Legacy Camera, Sprint Viewmodel) control systems that only exist in Evade, so they aren't
+listed.
+
+### Mobile
+On touch devices without a keyboard (Evade's `InteractType` "Mobile"), Evade's `HUD/Mobile` buttons
+appear:
+- **CROUCH:** a toggle; each tap switches crouch on or off and the button greys out while it's on.
+- **POV:** switches between first and third person.
+- **MENU:** opens the settings menu.
+
+The right-hand group copies the size and position of Roblox's jump button, as in Evade. Jumping uses
+Roblox's touch jump button, and movement uses Roblox's thumbstick. If the PlayerModule loads late, the
+script attaches to it when it appears. In third person, dragging on the screen turns the camera.
+`CONFIG.UI.ForceMobile = true` shows the buttons on a PC for testing.
 
 ### Executor hygiene
 - **Services:** every service comes through `cloneref` (or `clonereference`), with the plain service as
