@@ -177,6 +177,8 @@ local CONFIG = {
 		-- First-person body visibility (MEASURED Character/Client/Visibility): "NoArms" shows legs + torso;
 		-- head, arms, root and accessories are hidden.  FOV above 90 hides everything ("None").
 		FirstPersonVisibility = "NoArms",
+		POVScroll = true, -- MEASURED Config/Player/Settings POVScroll default true (settings menu)
+		TouchLookSpeed = Vector2.new(0.00945 * math.pi, 0.003375 * math.pi), -- Roblox touch pan, rad per pixel
 		ZoomRate = 12, -- zoom smoothing (1/s)
 		MaxPitch = math.rad(80), -- MEASURED: MaxY/MinY +-80
 		GamepadLookSpeed = Vector2.new(4.5, 3), -- rad/s at full right-stick deflection
@@ -226,7 +228,9 @@ local CONFIG = {
 		HearingDistance = 25, -- MEASURED: footsteps only within 25 studs of camera
 	},
 
-	UI = { Enabled = true },
+	-- ForceMobile shows Evade's mobile buttons even with a keyboard (testing); normally they appear only on
+	-- touch devices without a keyboard, like Evade's InteractType "Mobile".
+	UI = { Enabled = true, ForceMobile = false },
 
 	Remotes = {
 		-- "Count" = listen-only, outgoing registry terms are counted, never sent (default, safe).
@@ -1473,7 +1477,24 @@ function Input.Init()
 		Log.warn("Input", "ControlModule unavailable; using keyboard/gamepad fallback move vector")
 	end
 end
+-- PlayerScripts can arrive after the script starts (slow mobile loads); retry without yielding.
+function Input.TryAttach()
+	if Input.Controls or os.clock() - (Input.LastTry or 0) < 2 then
+		return
+	end
+	Input.LastTry = os.clock()
+	local ok, controls = pcall(function()
+		local ps = LocalPlayer:FindFirstChild("PlayerScripts")
+		local pm = ps and ps:FindFirstChild("PlayerModule")
+		return pm and require(pm):GetControls() or nil
+	end)
+	if ok and controls then
+		Input.Controls = controls
+		Log.info("Input", "ControlModule attached (late)")
+	end
+end
 function Input.GetMoveVector()
+	Input.TryAttach()
 	if Input.Controls then
 		local ok, v = pcall(Input.Controls.GetMoveVector, Input.Controls)
 		if ok and typeof(v) == "Vector3" then
@@ -2469,7 +2490,7 @@ end
 -- SECTION 11 : CAMERA  (CameraService FOV + ViewmodelDeviation Camera/Grounded springs + camera type)
 --==============================================================================
 -- State shared between the camera and the settings panel (UI is declared later in the file).
-local Shared = { SettingsOpen = false }
+local Shared = { SettingsOpen = false, TouchDelta = Vector2.zero }
 
 local CameraFX = {}
 CameraFX.__index = CameraFX
@@ -2576,6 +2597,9 @@ end
 -- toggles if the direction matches: scroll out (Z < 0) in first person -> third person at the fixed
 -- 6 studs, scroll in (Z > 0) in third person -> first person.
 function CameraFX:OnWheel(z)
+	if not CONFIG.Camera.POVScroll then -- MEASURED: TestThirdPerson checks Settings.Get("POVScroll")
+		return
+	end
 	self.ScrollAmt = (self.ScrollAmt or 0) + 1
 	if self.ScrollAmt <= CONFIG.Camera.ScrollToggleThreshold then
 		return
@@ -2635,6 +2659,13 @@ function CameraFX:UpdateThirdPerson(dt)
 		local perPixel = math.rad(0.5) * sens -- Roblox CameraInput mouse speed
 		self.Yaw -= d.X * perPixel
 		self.Pitch -= d.Y * perPixel * 0.77
+		-- Touch: drags that didn't start on a button/thumbstick turn the camera (Roblox touch pan speed).
+		local td = Shared.TouchDelta
+		if td.Magnitude > 0 then
+			self.Yaw -= td.X * c.TouchLookSpeed.X
+			self.Pitch -= td.Y * c.TouchLookSpeed.Y
+			Shared.TouchDelta = Vector2.zero
+		end
 		local g = self.GamepadLook
 		if g.Magnitude > 0.15 then
 			self.Yaw -= g.X * c.GamepadLookSpeed.X * dt
@@ -4033,13 +4064,192 @@ function UI.Init(maid)
 	Log.info("UI", ("HUD from %s mounted in %s"):format(source, how))
 	UI.Speed, UI.HealthValue = nil, nil
 	UI.BuildSettings(maid, parent)
+	UI.BuildMobile(maid, gui)
+end
+
+-- Generated from Evade's place file with tools/rbxl/rbxl_reader.luau (export). Do not edit by hand.
+local EVADE_UI = {
+	SettingsView = {
+		{ Path = "Settings", Class = "Frame", Props = { BackgroundColor3=Color3.new(1,1,1), BackgroundTransparency=1, Size=UDim2.new(1,0,1,0), Visible=false } },
+		{ Path = "Settings/Center", Class = "Frame", Props = { AnchorPoint=Vector2.new(0.5,0.5), BackgroundColor3=Color3.new(1,1,1), BackgroundTransparency=1, Position=UDim2.new(0.5,0,0.5,0), Size=UDim2.new(1,0,1,0) } },
+		{ Path = "Settings/Frame", Class = "Frame", Props = { AnchorPoint=Vector2.new(0,0.5), BackgroundColor3=Color3.new(0,0,0), BackgroundTransparency=0.3, BorderSizePixel=0, Position=UDim2.new(0,0,0.5,0), Size=UDim2.new(1,0,2,0), ZIndex=-10 } },
+		{ Path = "Settings/Center/Center", Class = "Frame", Props = { AnchorPoint=Vector2.new(0.5,0.5), BackgroundColor3=Color3.new(0.0588235,0.0588235,0.0588235), BackgroundTransparency=0.15, Position=UDim2.new(0.5,0,0.5,0), Size=UDim2.new(1,0,0.6,0) } },
+		{ Path = "Settings/Center/UIAspectRatioConstraint", Class = "UIAspectRatioConstraint", Props = {} },
+		{ Path = "Settings/Center/UISizeConstraint", Class = "UISizeConstraint", Props = { MaxSize=Vector2.new(700,700), MinSize=Vector2.new(450,450) } },
+		{ Path = "Settings/Center/Center/Frame", Class = "Frame", Props = { BackgroundColor3=Color3.new(1,1,1), BackgroundTransparency=1, BorderSizePixel=0, Size=UDim2.new(1,0,1,0), ZIndex=0 } },
+		{ Path = "Settings/Center/Center/Header", Class = "Frame", Props = { BackgroundColor3=Color3.new(1,1,1), BackgroundTransparency=1, BorderSizePixel=0, Size=UDim2.new(1,0,0.15,0) } },
+		{ Path = "Settings/Center/Center/ScrollingFrame", Class = "ScrollingFrame", Props = { Active=true, AnchorPoint=Vector2.new(0.5,0), BackgroundColor3=Color3.new(1,1,1), BackgroundTransparency=1, BorderSizePixel=0, Position=UDim2.new(0.5,0,0.15,0), ScrollBarThickness=3, Size=UDim2.new(0.98,0,0.84,0) } },
+		{ Path = "Settings/Center/Center/UICorner", Class = "UICorner", Props = { BottomLeftRadius=UDim.new(0,3), BottomRightRadius=UDim.new(0,3), TopLeftRadius=UDim.new(0,3), TopRightRadius=UDim.new(0,3) } },
+		{ Path = "Settings/Center/Center/UIGradient", Class = "UIGradient", Props = { Color=ColorSequence.new({ColorSequenceKeypoint.new(0,Color3.new(1,1,1)),ColorSequenceKeypoint.new(1,Color3.new(0.694118,0.694118,0.694118))}), Rotation=90, Transparency=NumberSequence.new({NumberSequenceKeypoint.new(0.00,0.00),NumberSequenceKeypoint.new(1.00,0.00)}) } },
+		{ Path = "Settings/Center/Center/UIStroke", Class = "UIStroke", Props = { Color=Color3.new(0.588235,0.588235,0.588235) } },
+		{ Path = "Settings/Center/Center/Frame/UICorner", Class = "UICorner", Props = { BottomLeftRadius=UDim.new(0,3), BottomRightRadius=UDim.new(0,3), TopLeftRadius=UDim.new(0,3), TopRightRadius=UDim.new(0,3) } },
+		{ Path = "Settings/Center/Center/Frame/UIStroke", Class = "UIStroke", Props = { Thickness=2 } },
+		{ Path = "Settings/Center/Center/Header/UIListLayout", Class = "UIListLayout", Props = { FillDirection=0, HorizontalAlignment=0, SortOrder=2 } },
+		{ Path = "Settings/Center/Center/ScrollingFrame/UIGridLayout", Class = "UIGridLayout", Props = { CellPadding=UDim2.new(0,0,0,0), CellSize=UDim2.new(0.5,0,0.1,0) } },
+	},
+	Slider = {
+		{ Path = "Slider", Class = "Frame", Props = { BackgroundColor3=Color3.new(1,1,1), BackgroundTransparency=1, BorderSizePixel=0, Size=UDim2.new(0,100,0,100), ZIndex=6 } },
+		{ Path = "Slider/Center", Class = "Frame", Props = { AnchorPoint=Vector2.new(0.5,0.5), BackgroundColor3=Color3.new(0,0,0), BackgroundTransparency=0.4, BorderSizePixel=0, Position=UDim2.new(0.5,0,0.5,0), Size=UDim2.new(0.97,0,0.9,0), ZIndex=3 } },
+		{ Path = "Slider/Center/Bar", Class = "Frame", Props = { AnchorPoint=Vector2.new(1,0.5), BackgroundColor3=Color3.new(0.105882,0.105882,0.105882), BackgroundTransparency=1, BorderSizePixel=0, Position=UDim2.new(0.99,0,0.68,0), Size=UDim2.new(0.74,0,0.5,0) } },
+		{ Path = "Slider/Center/Frame", Class = "Frame", Props = { BackgroundColor3=Color3.new(0.211765,0.211765,0.211765), BackgroundTransparency=0.6, BorderSizePixel=0, Size=UDim2.new(1,0,1,0), ZIndex=3 } },
+		{ Path = "Slider/Center/UICorner", Class = "UICorner", Props = { BottomLeftRadius=UDim.new(0.1,0), BottomRightRadius=UDim.new(0.1,0), TopLeftRadius=UDim.new(0.1,0), TopRightRadius=UDim.new(0.1,0) } },
+		{ Path = "Slider/Center/UIStroke", Class = "UIStroke", Props = { Color=Color3.new(0.588235,0.588235,0.588235), Transparency=0.7 } },
+		{ Path = "Slider/Center/Bar/Frame", Class = "Frame", Props = { AnchorPoint=Vector2.new(1,0), BackgroundColor3=Color3.new(0.105882,0.105882,0.105882), BorderSizePixel=0, Position=UDim2.new(1,0,0,0), Size=UDim2.new(0.725,0,1,0) } },
+		{ Path = "Slider/Center/Bar/SetValue", Class = "Frame", Props = { BackgroundColor3=Color3.new(0.105882,0.105882,0.105882), Size=UDim2.new(0.25,0,1,0) } },
+		{ Path = "Slider/Center/Frame/Icon", Class = "ImageLabel", Props = { AnchorPoint=Vector2.new(0.5,0.5), BackgroundColor3=Color3.new(1,1,1), BackgroundTransparency=1, BorderSizePixel=0, Image="rbxassetid://13343300062", Position=UDim2.new(0.5,0,0.5,0), Size=UDim2.new(0.8,0,0.8,0), ZIndex=4 } },
+		{ Path = "Slider/Center/Frame/Type", Class = "TextLabel", Props = { BackgroundColor3=Color3.new(1,1,1), BackgroundTransparency=1, BorderSizePixel=0, FontFace={font="rbxasset://fonts/families/GothamSSm.json",w=700,s=0}, Position=UDim2.new(1.08,0,0.05,0), Size=UDim2.new(2.25,0,0.3,0), Text="Title", TextColor3=Color3.new(1,1,1), TextScaled=true, TextSize=14, TextWrapped=true, TextXAlignment=0, ZIndex=5 } },
+		{ Path = "Slider/Center/Frame/UIAspectRatioConstraint", Class = "UIAspectRatioConstraint", Props = {} },
+		{ Path = "Slider/Center/Frame/UICorner", Class = "UICorner", Props = { BottomLeftRadius=UDim.new(0.1,0), BottomRightRadius=UDim.new(0.1,0), TopLeftRadius=UDim.new(0.1,0), TopRightRadius=UDim.new(0.1,0) } },
+		{ Path = "Slider/Center/Bar/Frame/Max", Class = "TextButton", Props = { AnchorPoint=Vector2.new(0,0.5), AutoButtonColor=false, BackgroundColor3=Color3.new(1,1,1), BackgroundTransparency=1, BorderSizePixel=0, FontFace={font="rbxasset://fonts/families/SourceSansPro.json",w=400,s=0}, Position=UDim2.new(0.05,0,0.5,0), Size=UDim2.new(0.875,0,0.8,0), Text="", TextColor3=Color3.new(0,0,0), TextSize=14 } },
+		{ Path = "Slider/Center/Bar/Frame/UICorner", Class = "UICorner", Props = { BottomLeftRadius=UDim.new(0,5), BottomRightRadius=UDim.new(0,5), TopLeftRadius=UDim.new(0,5), TopRightRadius=UDim.new(0,5) } },
+		{ Path = "Slider/Center/Bar/SetValue/Int", Class = "TextLabel", Props = { AnchorPoint=Vector2.new(0,0.5), BackgroundColor3=Color3.new(1,1,1), BackgroundTransparency=1, FontFace={font="rbxasset://fonts/families/GothamSSm.json",w=700,s=0}, Position=UDim2.new(0,0,0.5,0), Size=UDim2.new(1,0,0.6,0), Text="100%", TextColor3=Color3.new(1,1,1), TextScaled=true, TextSize=14, TextWrapped=true } },
+		{ Path = "Slider/Center/Bar/SetValue/UICorner", Class = "UICorner", Props = { BottomLeftRadius=UDim.new(0,5), BottomRightRadius=UDim.new(0,5), TopLeftRadius=UDim.new(0,5), TopRightRadius=UDim.new(0,5) } },
+		{ Path = "Slider/Center/Frame/Type/UIStroke", Class = "UIStroke", Props = { Transparency=0.5 } },
+		{ Path = "Slider/Center/Bar/Frame/Max/Bar", Class = "Frame", Props = { AnchorPoint=Vector2.new(0,0.5), BackgroundColor3=Color3.new(0.713726,0.713726,0.713726), BorderSizePixel=0, Position=UDim2.new(0,0,0.5,0), Size=UDim2.new(1,0,0.25,0), ZIndex=2 } },
+		{ Path = "Slider/Center/Bar/Frame/Max/Under", Class = "Frame", Props = { AnchorPoint=Vector2.new(0,0.5), BackgroundColor3=Color3.new(0.164706,0.164706,0.164706), BorderSizePixel=0, Position=UDim2.new(0,0,0.5,0), Size=UDim2.new(1,0,0.25,0) } },
+		{ Path = "Slider/Center/Bar/Frame/Max/Bar/Frame", Class = "Frame", Props = { AnchorPoint=Vector2.new(0.5,0.5), BackgroundColor3=Color3.new(1,1,1), Position=UDim2.new(1,0,0.5,0), Size=UDim2.new(2.5,0,2.5,0), ZIndex=3 } },
+		{ Path = "Slider/Center/Bar/Frame/Max/Bar/UICorner", Class = "UICorner", Props = { BottomLeftRadius=UDim.new(0.5,0), BottomRightRadius=UDim.new(0.5,0), TopLeftRadius=UDim.new(0.5,0), TopRightRadius=UDim.new(0.5,0) } },
+		{ Path = "Slider/Center/Bar/Frame/Max/Under/UICorner", Class = "UICorner", Props = { BottomLeftRadius=UDim.new(0.5,0), BottomRightRadius=UDim.new(0.5,0), TopLeftRadius=UDim.new(0.5,0), TopRightRadius=UDim.new(0.5,0) } },
+		{ Path = "Slider/Center/Bar/Frame/Max/Bar/Frame/UIAspectRatioConstraint", Class = "UIAspectRatioConstraint", Props = {} },
+		{ Path = "Slider/Center/Bar/Frame/Max/Bar/Frame/UICorner", Class = "UICorner", Props = { BottomLeftRadius=UDim.new(0.5,0), BottomRightRadius=UDim.new(0.5,0), TopLeftRadius=UDim.new(0.5,0), TopRightRadius=UDim.new(0.5,0) } },
+	},
+	Boolean = {
+		{ Path = "Boolean", Class = "Frame", Props = { BackgroundColor3=Color3.new(1,1,1), BackgroundTransparency=1, BorderSizePixel=0, Size=UDim2.new(0,100,0,100) } },
+		{ Path = "Boolean/Center", Class = "Frame", Props = { AnchorPoint=Vector2.new(0.5,0.5), BackgroundColor3=Color3.new(0,0,0), BackgroundTransparency=0.4, BorderSizePixel=0, Position=UDim2.new(0.5,0,0.5,0), Size=UDim2.new(0.97,0,0.9,0), ZIndex=3 } },
+		{ Path = "Boolean/Center/Frame", Class = "Frame", Props = { BackgroundColor3=Color3.new(0.211765,0.211765,0.211765), BackgroundTransparency=0.6, BorderSizePixel=0, Size=UDim2.new(1,0,1,0), ZIndex=3 } },
+		{ Path = "Boolean/Center/TextButton", Class = "TextButton", Props = { AnchorPoint=Vector2.new(1,0), BackgroundColor3=Color3.new(0.372549,0.847059,0.380392), BorderSizePixel=0, FontFace={font="rbxasset://fonts/families/SourceSansPro.json",w=400,s=0}, Position=UDim2.new(1,0,0,0), Size=UDim2.new(1,0,1,0), Text="", TextColor3=Color3.new(0,0,0), TextSize=14, ZIndex=3 } },
+		{ Path = "Boolean/Center/UICorner", Class = "UICorner", Props = { BottomLeftRadius=UDim.new(0.1,0), BottomRightRadius=UDim.new(0.1,0), TopLeftRadius=UDim.new(0.1,0), TopRightRadius=UDim.new(0.1,0) } },
+		{ Path = "Boolean/Center/UIStroke", Class = "UIStroke", Props = { Color=Color3.new(0.588235,0.588235,0.588235), Transparency=0.7 } },
+		{ Path = "Boolean/Center/Frame/Desc", Class = "TextLabel", Props = { BackgroundColor3=Color3.new(1,1,1), BackgroundTransparency=1, BorderSizePixel=0, FontFace={font="rbxasset://fonts/families/GothamSSm.json",w=700,s=0}, Position=UDim2.new(1.08,0,0.36,0), Size=UDim2.new(2.25,0,0.55,0), Text="Desc", TextColor3=Color3.new(0.505882,0.505882,0.505882), TextSize=12, TextWrapped=true, TextXAlignment=0, TextYAlignment=0, ZIndex=5 } },
+		{ Path = "Boolean/Center/Frame/Icon", Class = "ImageLabel", Props = { AnchorPoint=Vector2.new(0.5,0.5), BackgroundColor3=Color3.new(1,1,1), BackgroundTransparency=1, BorderSizePixel=0, Image="rbxassetid://12988752403", Position=UDim2.new(0.5,0,0.5,0), Size=UDim2.new(0.8,0,0.8,0), ZIndex=4 } },
+		{ Path = "Boolean/Center/Frame/Type", Class = "TextLabel", Props = { BackgroundColor3=Color3.new(1,1,1), BackgroundTransparency=1, BorderSizePixel=0, FontFace={font="rbxasset://fonts/families/GothamSSm.json",w=700,s=0}, Position=UDim2.new(1.08,0,0.05,0), Size=UDim2.new(2.25,0,0.3,0), Text="Title", TextColor3=Color3.new(1,1,1), TextScaled=true, TextSize=14, TextWrapped=true, TextXAlignment=0, ZIndex=5 } },
+		{ Path = "Boolean/Center/Frame/UIAspectRatioConstraint", Class = "UIAspectRatioConstraint", Props = {} },
+		{ Path = "Boolean/Center/Frame/UICorner", Class = "UICorner", Props = { BottomLeftRadius=UDim.new(0.1,0), BottomRightRadius=UDim.new(0.1,0), TopLeftRadius=UDim.new(0.1,0), TopRightRadius=UDim.new(0.1,0) } },
+		{ Path = "Boolean/Center/TextButton/Enabled", Class = "ImageLabel", Props = { AnchorPoint=Vector2.new(0.5,0.5), BackgroundColor3=Color3.new(1,1,1), BackgroundTransparency=1, BorderSizePixel=0, Image="rbxassetid://73965231027852", ImageColor3=Color3.new(0,0,0), ImageTransparency=0.6, Position=UDim2.new(0.5,0,0.5,0), Size=UDim2.new(0.7,0,0.7,0), ZIndex=6 } },
+		{ Path = "Boolean/Center/TextButton/Frame", Class = "Frame", Props = { AnchorPoint=Vector2.new(0.5,0.5), BackgroundColor3=Color3.new(1,1,1), BackgroundTransparency=1, Position=UDim2.new(0.5,0,0.5,0), Size=UDim2.new(1,-8,1,-8), ZIndex=10 } },
+		{ Path = "Boolean/Center/TextButton/UIAspectRatioConstraint", Class = "UIAspectRatioConstraint", Props = {} },
+		{ Path = "Boolean/Center/TextButton/UICorner", Class = "UICorner", Props = { BottomLeftRadius=UDim.new(0.1,0), BottomRightRadius=UDim.new(0.1,0), TopLeftRadius=UDim.new(0.1,0), TopRightRadius=UDim.new(0.1,0) } },
+		{ Path = "Boolean/Center/TextButton/UIGradient", Class = "UIGradient", Props = { Color=ColorSequence.new({ColorSequenceKeypoint.new(0,Color3.new(1,1,1)),ColorSequenceKeypoint.new(1,Color3.new(0.811765,0.811765,0.811765))}), Rotation=90, Transparency=NumberSequence.new({NumberSequenceKeypoint.new(0.00,0.00),NumberSequenceKeypoint.new(1.00,0.00)}) } },
+		{ Path = "Boolean/Center/Frame/Desc/UIStroke", Class = "UIStroke", Props = { Transparency=0.5 } },
+		{ Path = "Boolean/Center/Frame/Type/UIStroke", Class = "UIStroke", Props = { Transparency=0.5 } },
+		{ Path = "Boolean/Center/TextButton/Frame/UICorner", Class = "UICorner", Props = { BottomLeftRadius=UDim.new(0.06,0), BottomRightRadius=UDim.new(0.06,0), TopLeftRadius=UDim.new(0.06,0), TopRightRadius=UDim.new(0.06,0) } },
+		{ Path = "Boolean/Center/TextButton/Frame/UIStroke", Class = "UIStroke", Props = { ApplyStrokeMode=1, Thickness=2, Transparency=0.7 } },
+	},
+	TopButton = {
+		{ Path = "TopButton", Class = "Frame", Props = { BackgroundColor3=Color3.new(1,1,1), BackgroundTransparency=1, BorderSizePixel=0, Size=UDim2.new(0.33,0,1,0) } },
+		{ Path = "TopButton/TextButton", Class = "TextButton", Props = { AnchorPoint=Vector2.new(0.5,0.5), BackgroundColor3=Color3.new(0.0980392,0.0980392,0.0980392), BorderSizePixel=0, FontFace={font="rbxasset://fonts/families/SourceSansPro.json",w=400,s=0}, Position=UDim2.new(0.5,0,0.5,0), Size=UDim2.new(0.95,0,0.8,0), Text="", TextColor3=Color3.new(0,0,0), TextSize=14 } },
+		{ Path = "TopButton/TextButton/Frame", Class = "Frame", Props = { AnchorPoint=Vector2.new(0.5,0.5), BackgroundColor3=Color3.new(1,1,1), BackgroundTransparency=1, Position=UDim2.new(0.5,0,0.5,0), Size=UDim2.new(1,-8,1,-8), ZIndex=2 } },
+		{ Path = "TopButton/TextButton/ImageLabel", Class = "ImageLabel", Props = { AnchorPoint=Vector2.new(0.5,0.5), BackgroundColor3=Color3.new(1,1,1), BackgroundTransparency=1, BorderSizePixel=0, Image="rbxassetid://18941373944", Position=UDim2.new(0.5,0,0.35,0), Size=UDim2.new(1.8,0,1.8,0), Visible=false, ZIndex=2 } },
+		{ Path = "TopButton/TextButton/TextLabel", Class = "TextLabel", Props = { AnchorPoint=Vector2.new(0.5,0.5), BackgroundColor3=Color3.new(1,1,1), BackgroundTransparency=1, FontFace={font="rbxasset://fonts/families/GothamSSm.json",w=700,s=0}, Position=UDim2.new(0.5,0,0.5,0), Size=UDim2.new(0.9,0,0.45,0), Text="USABLES", TextColor3=Color3.new(1,1,1), TextScaled=true, TextSize=14, TextStrokeTransparency=0.9, TextWrapped=true, ZIndex=3 } },
+		{ Path = "TopButton/TextButton/UICorner", Class = "UICorner", Props = { BottomLeftRadius=UDim.new(0.15,0), BottomRightRadius=UDim.new(0.15,0), TopLeftRadius=UDim.new(0.15,0), TopRightRadius=UDim.new(0.15,0) } },
+		{ Path = "TopButton/TextButton/Frame/UICorner", Class = "UICorner", Props = { BottomLeftRadius=UDim.new(0.1,0), BottomRightRadius=UDim.new(0.1,0), TopLeftRadius=UDim.new(0.1,0), TopRightRadius=UDim.new(0.1,0) } },
+		{ Path = "TopButton/TextButton/Frame/UIStroke", Class = "UIStroke", Props = { ApplyStrokeMode=1, Color=Color3.new(0.905882,0.905882,0.905882), Thickness=2, Transparency=0.9 } },
+		{ Path = "TopButton/TextButton/ImageLabel/UIAspectRatioConstraint", Class = "UIAspectRatioConstraint", Props = {} },
+		{ Path = "TopButton/TextButton/TextLabel/UIStroke", Class = "UIStroke", Props = { Thickness=2, Transparency=0.5 } },
+	},
+	TopExit = {
+		{ Path = "TopExit", Class = "Frame", Props = { BackgroundColor3=Color3.new(1,1,1), BackgroundTransparency=1, BorderSizePixel=0, Size=UDim2.new(0.09,0,1,0) } },
+		{ Path = "TopExit/TextButton", Class = "TextButton", Props = { AnchorPoint=Vector2.new(0.5,0.5), BackgroundColor3=Color3.new(0.831373,0.254902,0.254902), BorderSizePixel=0, FontFace={font="rbxasset://fonts/families/SourceSansPro.json",w=400,s=0}, Position=UDim2.new(0.5,0,0.5,0), Size=UDim2.new(0.8,0,0.8,0), Text="", TextColor3=Color3.new(0,0,0), TextSize=14 } },
+		{ Path = "TopExit/TextButton/Frame", Class = "Frame", Props = { AnchorPoint=Vector2.new(0.5,0.5), BackgroundColor3=Color3.new(1,1,1), BackgroundTransparency=1, Position=UDim2.new(0.5,0,0.5,0), Size=UDim2.new(1,-8,1,-8), ZIndex=2 } },
+		{ Path = "TopExit/TextButton/TextLabel", Class = "TextLabel", Props = { AnchorPoint=Vector2.new(0.5,0.5), BackgroundColor3=Color3.new(1,1,1), BackgroundTransparency=1, FontFace={font="rbxasset://fonts/families/GothamSSm.json",w=700,s=0}, Position=UDim2.new(0.5,0,0.5,0), Size=UDim2.new(0.9,0,0.9,0), Text="X", TextColor3=Color3.new(1,1,1), TextScaled=true, TextSize=14, TextStrokeTransparency=0.9, TextWrapped=true, ZIndex=3 } },
+		{ Path = "TopExit/TextButton/UICorner", Class = "UICorner", Props = { BottomLeftRadius=UDim.new(0.15,0), BottomRightRadius=UDim.new(0.15,0), TopLeftRadius=UDim.new(0.15,0), TopRightRadius=UDim.new(0.15,0) } },
+		{ Path = "TopExit/TextButton/UIGradient", Class = "UIGradient", Props = { Color=ColorSequence.new({ColorSequenceKeypoint.new(0,Color3.new(1,1,1)),ColorSequenceKeypoint.new(1,Color3.new(0.854902,0.854902,0.854902))}), Rotation=90, Transparency=NumberSequence.new({NumberSequenceKeypoint.new(0.00,0.00),NumberSequenceKeypoint.new(1.00,0.00)}) } },
+		{ Path = "TopExit/TextButton/Frame/UICorner", Class = "UICorner", Props = { BottomLeftRadius=UDim.new(0.1,0), BottomRightRadius=UDim.new(0.1,0), TopLeftRadius=UDim.new(0.1,0), TopRightRadius=UDim.new(0.1,0) } },
+		{ Path = "TopExit/TextButton/Frame/UIStroke", Class = "UIStroke", Props = { ApplyStrokeMode=1, Thickness=2, Transparency=0.9 } },
+		{ Path = "TopExit/TextButton/TextLabel/UIStroke", Class = "UIStroke", Props = { Thickness=2, Transparency=0.6 } },
+	},
+	Mobile = {
+		{ Path = "Mobile", Class = "Frame", Props = { BackgroundColor3=Color3.new(1,1,1), BackgroundTransparency=1, BorderSizePixel=0, Size=UDim2.new(1,0,1,0), Visible=false } },
+		{ Path = "Mobile/Left", Class = "Frame", Props = { AnchorPoint=Vector2.new(0,0.5), BackgroundColor3=Color3.new(1,1,1), BackgroundTransparency=1, BorderSizePixel=0, Position=UDim2.new(0,0,0.6,0), Size=UDim2.new(1,0,1,0) } },
+		{ Path = "Mobile/Right", Class = "Frame", Props = { BackgroundColor3=Color3.new(1,1,1), BackgroundTransparency=1, BorderSizePixel=0, Position=UDim2.new(1,-170,1,-210), Size=UDim2.new(0,120,0,120) } },
+		{ Path = "Mobile/Left/Mobile", Class = "Frame", Props = { BackgroundColor3=Color3.new(1,1,1), BackgroundTransparency=1, BorderSizePixel=0, Position=UDim2.new(0.01,6,0,0), Size=UDim2.new(0.86,0,0.86,0) } },
+		{ Path = "Mobile/Left/UIAspectRatioConstraint", Class = "UIAspectRatioConstraint", Props = {} },
+		{ Path = "Mobile/Left/UISizeConstraint", Class = "UISizeConstraint", Props = { MaxSize=Vector2.new(400,400) } },
+		{ Path = "Mobile/Right/Mobile", Class = "Frame", Props = { BackgroundColor3=Color3.new(1,1,1), BackgroundTransparency=1, BorderSizePixel=0, Size=UDim2.new(1,0,1,0) } },
+		{ Path = "Mobile/Left/Mobile/ChangePovButton", Class = "ImageButton", Props = { AnchorPoint=Vector2.new(0,0.5), AutoButtonColor=false, BackgroundColor3=Color3.new(0,0,0), BackgroundTransparency=0.5, ImageRectOffset=Vector2.new(1,146), ImageRectSize=Vector2.new(144,144), Position=UDim2.new(0,0,0.4,0), Size=UDim2.new(0.15,0,0.15,0) } },
+		{ Path = "Mobile/Left/Mobile/MenuButton", Class = "ImageButton", Props = { AnchorPoint=Vector2.new(0,0.5), AutoButtonColor=false, BackgroundColor3=Color3.new(0,0,0), BackgroundTransparency=0.5, ImageRectOffset=Vector2.new(1,146), ImageRectSize=Vector2.new(144,144), Position=UDim2.new(0,0,0.2,0), Size=UDim2.new(0.15,0,0.15,0) } },
+		{ Path = "Mobile/Right/Mobile/CrouchButton", Class = "ImageButton", Props = { AnchorPoint=Vector2.new(1,0), AutoButtonColor=false, BackgroundColor3=Color3.new(0,0,0), BackgroundTransparency=0.5, ImageRectOffset=Vector2.new(1,146), ImageRectSize=Vector2.new(144,144), Position=UDim2.new(-0.175001,0,0.458333,0), Size=UDim2.new(0.76,0,0.76,0) } },
+		{ Path = "Mobile/Left/Mobile/ChangePovButton/Frame", Class = "Frame", Props = { AnchorPoint=Vector2.new(0.5,0.5), BackgroundColor3=Color3.new(1,1,1), BackgroundTransparency=1, Position=UDim2.new(0.5,0,0.5,0), Size=UDim2.new(1,6,1,6) } },
+		{ Path = "Mobile/Left/Mobile/ChangePovButton/ImageLabel", Class = "ImageLabel", Props = { AnchorPoint=Vector2.new(0.5,0.5), BackgroundColor3=Color3.new(1,1,1), BackgroundTransparency=1, Image="rbxassetid://14333878755", ImageTransparency=0.6, Position=UDim2.new(0.51,0,0.4,0), Size=UDim2.new(0.6,0,0.6,0) } },
+		{ Path = "Mobile/Left/Mobile/ChangePovButton/TextLabel", Class = "TextLabel", Props = { AnchorPoint=Vector2.new(0.5,0.5), AutoLocalize=false, BackgroundColor3=Color3.new(1,1,1), BackgroundTransparency=1, FontFace={font="rbxasset://fonts/families/GothamSSm.json",w=700,s=0}, Position=UDim2.new(0.5,0,0.75,0), Size=UDim2.new(0.6,0,0.8,0), Text="POV", TextColor3=Color3.new(1,1,1), TextScaled=true, TextSize=14, TextTransparency=0.4, TextWrapped=true, ZIndex=3 } },
+		{ Path = "Mobile/Left/Mobile/ChangePovButton/UICorner", Class = "UICorner", Props = { BottomLeftRadius=UDim.new(0.5,0), BottomRightRadius=UDim.new(0.5,0), TopLeftRadius=UDim.new(0.5,0), TopRightRadius=UDim.new(0.5,0) } },
+		{ Path = "Mobile/Left/Mobile/ChangePovButton/UIStroke", Class = "UIStroke", Props = { Color=Color3.new(1,1,1), Thickness=3, Transparency=0.8 } },
+		{ Path = "Mobile/Left/Mobile/MenuButton/Frame", Class = "Frame", Props = { AnchorPoint=Vector2.new(0.5,0.5), BackgroundColor3=Color3.new(1,1,1), BackgroundTransparency=1, Position=UDim2.new(0.5,0,0.5,0), Size=UDim2.new(1,6,1,6) } },
+		{ Path = "Mobile/Left/Mobile/MenuButton/TextLabel", Class = "TextLabel", Props = { AnchorPoint=Vector2.new(0.5,0.5), BackgroundColor3=Color3.new(1,1,1), BackgroundTransparency=1, FontFace={font="rbxasset://fonts/families/GothamSSm.json",w=700,s=0}, Position=UDim2.new(0.5,0,0.5,0), Size=UDim2.new(0.8,0,0.8,0), Text="MENU", TextColor3=Color3.new(1,1,1), TextScaled=true, TextSize=14, TextTransparency=0.4, TextWrapped=true } },
+		{ Path = "Mobile/Left/Mobile/MenuButton/UICorner", Class = "UICorner", Props = { BottomLeftRadius=UDim.new(0.5,0), BottomRightRadius=UDim.new(0.5,0), TopLeftRadius=UDim.new(0.5,0), TopRightRadius=UDim.new(0.5,0) } },
+		{ Path = "Mobile/Left/Mobile/MenuButton/UIStroke", Class = "UIStroke", Props = { Color=Color3.new(1,1,1), Thickness=3, Transparency=0.8 } },
+		{ Path = "Mobile/Right/Mobile/CrouchButton/Frame", Class = "Frame", Props = { AnchorPoint=Vector2.new(0.5,0.5), BackgroundColor3=Color3.new(1,1,1), BackgroundTransparency=1, Position=UDim2.new(0.5,0,0.5,0), Size=UDim2.new(1,6,1,6) } },
+		{ Path = "Mobile/Right/Mobile/CrouchButton/ImageLabel", Class = "ImageLabel", Props = { AnchorPoint=Vector2.new(0.5,0.5), BackgroundColor3=Color3.new(1,1,1), BackgroundTransparency=1, Image="rbxassetid://10238983204", ImageTransparency=0.6, Position=UDim2.new(0.5,0,0.48,0), Size=UDim2.new(0.6,0,0.6,0) } },
+		{ Path = "Mobile/Right/Mobile/CrouchButton/UIAspectRatioConstraint", Class = "UIAspectRatioConstraint", Props = {} },
+		{ Path = "Mobile/Right/Mobile/CrouchButton/UICorner", Class = "UICorner", Props = { BottomLeftRadius=UDim.new(0.5,0), BottomRightRadius=UDim.new(0.5,0), TopLeftRadius=UDim.new(0.5,0), TopRightRadius=UDim.new(0.5,0) } },
+		{ Path = "Mobile/Right/Mobile/CrouchButton/UIStroke", Class = "UIStroke", Props = { Color=Color3.new(1,1,1), Thickness=3, Transparency=0.8 } },
+		{ Path = "Mobile/Left/Mobile/ChangePovButton/Frame/UICorner", Class = "UICorner", Props = { BottomLeftRadius=UDim.new(0.5,0), BottomRightRadius=UDim.new(0.5,0), TopLeftRadius=UDim.new(0.5,0), TopRightRadius=UDim.new(0.5,0) } },
+		{ Path = "Mobile/Left/Mobile/ChangePovButton/Frame/UIStroke", Class = "UIStroke", Props = { Thickness=2, Transparency=0.6 } },
+		{ Path = "Mobile/Left/Mobile/MenuButton/Frame/UICorner", Class = "UICorner", Props = { BottomLeftRadius=UDim.new(0.5,0), BottomRightRadius=UDim.new(0.5,0), TopLeftRadius=UDim.new(0.5,0), TopRightRadius=UDim.new(0.5,0) } },
+		{ Path = "Mobile/Left/Mobile/MenuButton/Frame/UIStroke", Class = "UIStroke", Props = { Thickness=2, Transparency=0.6 } },
+		{ Path = "Mobile/Right/Mobile/CrouchButton/Frame/UICorner", Class = "UICorner", Props = { BottomLeftRadius=UDim.new(0.5,0), BottomRightRadius=UDim.new(0.5,0), TopLeftRadius=UDim.new(0.5,0), TopRightRadius=UDim.new(0.5,0) } },
+		{ Path = "Mobile/Right/Mobile/CrouchButton/Frame/UIStroke", Class = "UIStroke", Props = { Thickness=2, Transparency=0.6 } },
+	},
+}
+--------------------------------------------------------------------------------
+-- Generic builder for rows exported from Evade's place file (same format as EVADE_HUD).
+-- Returns the root instance and a path -> instance map; children keep Evade's names.
+--------------------------------------------------------------------------------
+local function buildRows(rows)
+	local byPath, root = {}, nil
+	for _, row in rows do
+		local ok, inst = pcall(Instance.new, row.Class)
+		if ok and inst then
+			local parentPath, name = string.match(row.Path, "^(.*)/([^/]+)$")
+			inst.Name = name or row.Path
+			for key, value in row.Props do
+				applyProp(inst, key, value)
+			end
+			if parentPath and byPath[parentPath] then
+				inst.Parent = byPath[parentPath]
+			end
+			byPath[row.Path] = inst
+			root = root or inst
+		end
+	end
+	return root, byPath
 end
 
 --------------------------------------------------------------------------------
--- Settings panel (P): FOV slider 70-100 (Evade's FOV setting).  Saved to <Root>/settings.json.
--- The panel's Modal button frees the mouse while it is open, in first and third person.
+-- Settings menu (P, or the MENU button on mobile): Evade's own Menu/Views/Settings view, built from
+-- its place-file templates (TopButton, TopExit, Slider, Boolean) and driven the way Evade's
+-- Views/Settings module drives it.  Only the "Game" settings that exist outside Evade are listed.
+-- Values are saved to <Root>/settings.json.
 --------------------------------------------------------------------------------
 local SETTINGS_FILE = "settings.json"
+-- MEASURED: Views/Settings "Game" list (order kept) + Config/Player/Settings (type/default/min/max).
+local SETTING_ROWS = {
+	{ Type = "Viewbob", Name = "Viewbob", Icon = "rbxassetid://13085201731", Desc = "Determines if your camera moves", Kind = "boolean" },
+	{ Type = "FOV", Name = "Field of View", Icon = "rbxassetid://14333878755", Kind = "number", Min = 70, Max = 100 },
+	{ Type = "POVScroll", Name = "POV Scroll", Icon = "rbxassetid://8677931999", Desc = "Determines if the scroll wheel changes POV", Kind = "boolean" },
+}
+local GAME_TAB_ICON = "rbxassetid://302250236" -- MEASURED Views/Settings "Game" header icon
+
+local function getSetting(kind)
+	if kind == "FOV" then
+		return CONFIG.Camera.BaseFOV
+	elseif kind == "Viewbob" then
+		return CONFIG.Camera.Viewbob
+	elseif kind == "POVScroll" then
+		return CONFIG.Camera.POVScroll
+	end
+end
+
+local function setSetting(kind, value)
+	if kind == "FOV" then
+		CONFIG.Camera.BaseFOV = clamp(math.floor(tonumber(value) or 70), CONFIG.Camera.FOVMin, CONFIG.Camera.FOVMax)
+	elseif kind == "Viewbob" then
+		CONFIG.Camera.Viewbob = value == true
+	elseif kind == "POVScroll" then
+		CONFIG.Camera.POVScroll = value == true
+	end
+	UI.SaveSettings()
+end
 
 function UI.LoadSettings()
 	local text = Assets.ReadFile(Assets.Path(SETTINGS_FILE))
@@ -4047,105 +4257,150 @@ function UI.LoadSettings()
 		return
 	end
 	local ok, data = pcall(function()
-		return getService("HttpService"):JSONDecode(text)
+		return HttpService:JSONDecode(text)
 	end)
-	if ok and type(data) == "table" and tonumber(data.FOV) then
+	if not (ok and type(data) == "table") then
+		return
+	end
+	if tonumber(data.FOV) then
 		CONFIG.Camera.BaseFOV = clamp(tonumber(data.FOV), CONFIG.Camera.FOVMin, CONFIG.Camera.FOVMax)
+	end
+	if type(data.Viewbob) == "boolean" then
+		CONFIG.Camera.Viewbob = data.Viewbob
+	end
+	if type(data.POVScroll) == "boolean" then
+		CONFIG.Camera.POVScroll = data.POVScroll
 	end
 end
 
 function UI.SaveSettings()
 	local ok, text = pcall(function()
-		return getService("HttpService"):JSONEncode({ FOV = CONFIG.Camera.BaseFOV })
+		return HttpService:JSONEncode({ FOV = CONFIG.Camera.BaseFOV, Viewbob = CONFIG.Camera.Viewbob, POVScroll = CONFIG.Camera.POVScroll })
 	end)
 	if ok then
 		Assets.WriteFile(Assets.Path(SETTINGS_FILE), text)
 	end
 end
 
-function UI.BuildSettings(maid, parent)
-	local c = CONFIG.Camera
-	local gui = make("ScreenGui", { Name = hiddenName(), ResetOnSpawn = false, Enabled = false, DisplayOrder = 10, ZIndexBehavior = Enum.ZIndexBehavior.Global })
-	local panel = make("TextButton", {
-		-- Modal frees the locked mouse.  It is only switched on while the panel is open: a Modal button
-		-- inside a disabled ScreenGui still kept the cursor unlocked, so third-person mouse look needed RMB.
-		Name = "Panel", Text = "", AutoButtonColor = false, Modal = false,
-		AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5), Size = UDim2.fromOffset(360, 150),
-		BackgroundColor3 = Color3.fromRGB(20, 20, 24), BackgroundTransparency = 0.1, BorderSizePixel = 0,
-	}, { corner(0, 12), make("UIStroke", { Color = Color3.fromRGB(255, 255, 255), Transparency = 0.85, Thickness = 1 }) })
-	panel.Parent = gui
-	local function label(props)
-		props.BackgroundTransparency = 1
-		props.FontFace = GOTHAM_BOLD
-		props.TextColor3 = props.TextColor3 or Color3.fromRGB(235, 235, 240)
-		local l = make("TextLabel", props)
-		l.Parent = panel
-		return l
-	end
-	label({ Text = "SETTINGS", TextSize = 18, TextXAlignment = Enum.TextXAlignment.Left, Position = UDim2.fromOffset(20, 14), Size = UDim2.fromOffset(200, 22) })
-	local close = make("TextButton", {
-		Text = "X", TextSize = 16, FontFace = GOTHAM_BOLD, TextColor3 = Color3.fromRGB(200, 200, 205), AutoButtonColor = true,
-		AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, -12, 0, 10), Size = UDim2.fromOffset(28, 28),
-		BackgroundColor3 = Color3.fromRGB(45, 45, 52), BorderSizePixel = 0,
-	}, { corner(0, 6) })
-	close.Parent = panel
-	label({ Text = "Field of View", TextSize = 15, TextXAlignment = Enum.TextXAlignment.Left, Position = UDim2.fromOffset(20, 56), Size = UDim2.fromOffset(200, 20) })
-	local valueText = label({ Text = "", TextSize = 15, TextXAlignment = Enum.TextXAlignment.Right, AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, -20, 0, 56), Size = UDim2.fromOffset(80, 20), TextColor3 = Color3.fromRGB(112, 255, 73) })
-	local bar = make("TextButton", {
-		Name = "Bar", Text = "", AutoButtonColor = false, Position = UDim2.fromOffset(20, 92), Size = UDim2.new(1, -40, 0, 10),
-		BackgroundColor3 = Color3.fromRGB(60, 60, 70), BorderSizePixel = 0,
-	}, { corner(1, 0) })
-	bar.Parent = panel
-	local fill = make("Frame", { BackgroundColor3 = Color3.fromRGB(112, 255, 73), BorderSizePixel = 0, Size = UDim2.fromScale(0, 1) }, { corner(1, 0) })
-	fill.Parent = bar
-	local knob = make("Frame", {
-		AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0, 0.5), Size = UDim2.fromOffset(18, 18),
-		BackgroundColor3 = Color3.fromRGB(255, 255, 255), BorderSizePixel = 0, ZIndex = 2,
-	}, { corner(1, 0) })
-	knob.Parent = bar
-	label({ Text = ("%d"):format(c.FOVMin), TextSize = 12, TextColor3 = Color3.fromRGB(140, 140, 150), TextXAlignment = Enum.TextXAlignment.Left, Position = UDim2.fromOffset(20, 110), Size = UDim2.fromOffset(40, 16) })
-	label({ Text = ("%d"):format(c.FOVMax), TextSize = 12, TextColor3 = Color3.fromRGB(140, 140, 150), TextXAlignment = Enum.TextXAlignment.Right, AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, -20, 0, 110), Size = UDim2.fromOffset(40, 16) })
+-- MEASURED Views/Settings.SetTopButtonActive
+local function setTopButtonActive(button, active)
+	button.TextButton.BackgroundColor3 = active and Color3.fromRGB(212, 175, 122) or Color3.fromRGB(25, 25, 25)
+	button.TextButton.Frame.UIStroke.Color = active and Color3.fromRGB(0, 0, 0) or Color3.fromRGB(231, 231, 231)
+end
 
-	local function render()
-		local a = (c.BaseFOV - c.FOVMin) / (c.FOVMax - c.FOVMin)
-		fill.Size = UDim2.fromScale(a, 1)
-		knob.Position = UDim2.fromScale(a, 0.5)
-		valueText.Text = ("%d"):format(c.BaseFOV)
+-- MEASURED Views/Settings.SetSettingValue
+local function setSettingValue(entry, value)
+	local center = entry.Instance.Center
+	if entry.Type == "boolean" then
+		if value then
+			center.TextButton.BackgroundColor3 = Color3.fromRGB(95, 216, 97)
+			center.TextButton.Enabled.Image = "rbxassetid://73965231027852"
+		else
+			center.TextButton.BackgroundColor3 = Color3.fromRGB(216, 94, 94)
+			center.TextButton.Enabled.Image = "rbxassetid://116447909270552"
+		end
+	elseif entry.Type == "number" then
+		center.Bar.Frame.Max.Bar.Size = UDim2.new((value - entry.Min) / (entry.Max - entry.Min), 0, 0.25, 0)
+		center.Bar.SetValue.Int.Text = tostring(value)
 	end
-	local function setFromX(x)
-		local a = clamp((x - bar.AbsolutePosition.X) / math.max(bar.AbsoluteSize.X, 1), 0, 1)
-		c.BaseFOV = math.floor(c.FOVMin + a * (c.FOVMax - c.FOVMin) + 0.5)
-		render()
-	end
-	local dragging = false
-	maid:Give(bar.InputBegan:Connect(function(input)
-		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-			dragging = true
-			setFromX(input.Position.X)
-		end
-	end))
-	maid:Give(UserInputService.InputChanged:Connect(function(input)
-		if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
-			setFromX(input.Position.X)
-		end
-	end))
-	maid:Give(UserInputService.InputEnded:Connect(function(input)
-		if dragging and (input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch) then
-			dragging = false
-			UI.SaveSettings()
-		end
-	end))
-	maid:Give(close.MouseButton1Click:Connect(function()
+end
+
+function UI.BuildSettings(maid, parent)
+	-- Menu ScreenGui (MEASURED: ScreenInsets DeviceSafeInsets, ZIndexBehavior Global) -> Views -> Settings
+	local gui = make("ScreenGui", {
+		Name = hiddenName(), ResetOnSpawn = false, Enabled = false, DisplayOrder = 10,
+		ZIndexBehavior = Enum.ZIndexBehavior.Global, ScreenInsets = Enum.ScreenInsets.DeviceSafeInsets,
+	})
+	local views = make("Frame", { Name = "Views", AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5), Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1 })
+	views.Parent = gui
+	local view = buildRows(EVADE_UI.SettingsView)
+	view.Visible = true
+	view.Parent = views
+	local center = view.Center.Center
+
+	-- Header: one tab per category (Evade has Volume / Visuals / Game; only Game applies here) + exit.
+	local exitScale = EVADE_UI.TopExit[1].Props.Size.X.Scale
+	local tab = buildRows(EVADE_UI.TopButton)
+	tab.Size = UDim2.new((1 - exitScale) / 3, 0, 1, 0)
+	tab.TextButton.ImageLabel.Image = GAME_TAB_ICON
+	tab.TextButton.TextLabel.Text = "GAME"
+	setTopButtonActive(tab, true)
+	tab.Parent = center.Header
+	local exit = buildRows(EVADE_UI.TopExit)
+	exit.Parent = center.Header
+	maid:Give(exit.TextButton.Activated:Connect(function()
 		UI.ToggleSettings(false)
 	end))
-	render()
+
+	UI.SettingEntries = {}
+	for _, def in SETTING_ROWS do
+		local inst = buildRows(def.Kind == "number" and EVADE_UI.Slider or EVADE_UI.Boolean)
+		inst.Center.Frame.Type.Text = def.Name
+		local desc = inst.Center.Frame:FindFirstChild("Desc")
+		if desc then
+			desc.Text = def.Desc or ""
+		end
+		inst.Center.Frame.Icon.Image = def.Icon
+		local entry = { Instance = inst, Value = getSetting(def.Type), Type = def.Kind, VisualType = def.Type, Min = def.Min, Max = def.Max }
+		if def.Kind == "boolean" then
+			maid:Give(inst.Center.TextButton.Activated:Connect(function()
+				entry.Value = not entry.Value
+				setSetting(entry.VisualType, entry.Value)
+				setSettingValue(entry, entry.Value)
+			end))
+		else
+			maid:Give(inst.Center.Bar.Frame.Max.InputBegan:Connect(function(input)
+				if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+					UI.PointerX = input.Position.X
+					UI.SelectedSetting = entry
+				end
+			end))
+		end
+		setSettingValue(entry, entry.Value)
+		table.insert(UI.SettingEntries, entry)
+		inst.Parent = center.ScrollingFrame
+	end
+
+	-- Slider drag (MEASURED Views/Settings.Update): percentage of the Max bar, floored, then floored value.
+	maid:Give(RunService.RenderStepped:Connect(function()
+		local sel = UI.SelectedSetting
+		if not sel then
+			return
+		end
+		local max = sel.Instance.Center.Bar.Frame.Max
+		local x0 = max.AbsolutePosition.X
+		local px = UI.PointerX or UserInputService:GetMouseLocation().X
+		local pct = math.floor(clamp((x0 - px) / (x0 - (max.AbsoluteSize.X + x0)), 0, 1) * 100)
+		sel.CurrentValue = math.floor(sel.Min + (sel.Max - sel.Min) * (pct / 100))
+		setSettingValue(sel, sel.CurrentValue)
+	end))
+	maid:Give(UserInputService.InputChanged:Connect(function(input)
+		if UI.SelectedSetting and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+			UI.PointerX = input.Position.X
+		end
+	end))
+	-- Release commits (MEASURED Views/Settings.Initialize InputEnded)
+	maid:Give(UserInputService.InputEnded:Connect(function(input)
+		local sel = UI.SelectedSetting
+		if sel and (input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch) then
+			if sel.CurrentValue then
+				sel.Value = sel.CurrentValue
+				setSettingValue(sel, sel.Value)
+				setSetting(sel.VisualType, sel.Value)
+			end
+			sel.CurrentValue = nil
+			UI.SelectedSetting = nil
+			UI.PointerX = nil
+		end
+	end))
+
 	gui.Parent = parent
 	maid:Give(gui)
 	maid:Give(function()
 		Shared.SettingsOpen = false
 	end)
 	UI.SettingsGui = gui
-	UI.RenderSettings = render
+	UI.SettingsExit = exit.TextButton
 end
 
 function UI.ToggleSettings(open)
@@ -4160,18 +4415,172 @@ function UI.ToggleSettings(open)
 		return
 	end
 	gui.Enabled = open
-	gui.Panel.Modal = open
+	UI.SettingsExit.Modal = open -- frees the locked mouse while the menu is open
 	Shared.SettingsOpen = open
 	if open then
-		-- Roblox's camera caches the mouse mode it last set and won't reapply it, so remember it here
-		-- and put it back on close (otherwise first person stays unlocked).
 		UI.MouseBehaviorBeforeSettings = UserInputService.MouseBehavior
 		UserInputService.MouseBehavior = Enum.MouseBehavior.Default
-		UI.RenderSettings()
+		for _, entry in UI.SettingEntries or {} do
+			entry.Value = getSetting(entry.VisualType)
+			setSettingValue(entry, entry.Value)
+		end
 	else
+		UI.SelectedSetting = nil
 		UserInputService.MouseBehavior = UI.MouseBehaviorBeforeSettings or Enum.MouseBehavior.Default
 		UI.SaveSettings()
 	end
+end
+
+--------------------------------------------------------------------------------
+-- Mobile buttons (Evade GameUIService/Types/MobileButtons): built from Evade's HUD/Mobile frame, shown only
+-- on touch devices without a keyboard (Evade InteractType "Mobile").  CrouchButton toggles (IgnoreHold),
+-- ChangePovButton presses ThirdPerson, MenuButton opens the settings menu.  The Right group copies
+-- the size and position of Roblox's jump button (AlignToJumpButton).  UI.MobileHandlers is set by
+-- bindInput.
+--------------------------------------------------------------------------------
+UI.MobileHandlers = {}
+
+function UI.IsMobile()
+	return CONFIG.UI.ForceMobile == true or (UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled)
+end
+
+-- MEASURED MobileButtons.ButtonActive
+local buttonColorCache = setmetatable({}, { __mode = "k" })
+local function buttonActive(button, active)
+	local labels = {}
+	for _, ch in button:GetChildren() do
+		if ch:IsA("ImageLabel") or ch:IsA("TextLabel") then
+			table.insert(labels, ch)
+		end
+	end
+	if not buttonColorCache[button] then
+		for _, l in labels do
+			buttonColorCache[button] = l:IsA("ImageLabel") and l.ImageColor3 or l.TextColor3
+			break
+		end
+	end
+	local bg, fg
+	if active then
+		bg, fg = Color3.new(0.5, 0.5, 0.5), Color3.new(0.1, 0.1, 0.1)
+	else
+		bg, fg = Color3.new(0, 0, 0), buttonColorCache[button] or Color3.new(1, 1, 1)
+	end
+	button.BackgroundColor3 = bg
+	for _, l in labels do
+		if l:IsA("ImageLabel") then
+			l.ImageColor3 = fg
+		else
+			l.TextColor3 = fg
+		end
+	end
+end
+
+function UI.BuildMobile(maid, hudGui)
+	if not UI.IsMobile() then
+		return
+	end
+	local root, by = buildRows(EVADE_UI.Mobile)
+	root.Visible = true
+	root.Parent = hudGui:FindFirstChild("HUD") or hudGui
+	UI.MobileFrame = root
+	local crouch = by["Mobile/Right/Mobile/CrouchButton"]
+	local pov = by["Mobile/Left/Mobile/ChangePovButton"]
+	local menu = by["Mobile/Left/Mobile/MenuButton"]
+
+	-- CrouchButton: IgnoreHold -> every tap toggles the key
+	local crouchDown = false
+	UI.MobileCrouchDown = function()
+		return crouchDown
+	end
+	maid:Give(crouch.Activated:Connect(function()
+		crouchDown = not crouchDown
+		buttonActive(crouch, crouchDown)
+		local h = UI.MobileHandlers.Crouch
+		if h then
+			h(crouchDown)
+		end
+	end))
+	-- ChangePovButton: held button (press -> ThirdPerson down; release -> up)
+	local povDown = false
+	local function povRelease()
+		if povDown then
+			povDown = false
+			buttonActive(pov, false)
+		end
+	end
+	maid:Give(pov.InputBegan:Connect(function(input)
+		if input.UserInputState ~= Enum.UserInputState.Begin then
+			return
+		end
+		if input.UserInputType ~= Enum.UserInputType.Touch and input.UserInputType ~= Enum.UserInputType.MouseButton1 then
+			return
+		end
+		if povDown then
+			return
+		end
+		povDown = true
+		buttonActive(pov, true)
+		local h = UI.MobileHandlers.ThirdPerson
+		if h then
+			h()
+		end
+		local conn
+		conn = input:GetPropertyChangedSignal("UserInputState"):Connect(function()
+			if input.UserInputState == Enum.UserInputState.End or input.UserInputState == Enum.UserInputState.Cancel then
+				conn:Disconnect()
+				povRelease()
+			end
+		end)
+		maid:Give(conn)
+	end))
+	-- MenuButton: IgnoreButtonUp -> opens the settings menu
+	maid:Give(menu.MouseButton1Down:Connect(function()
+		buttonActive(menu, true)
+	end))
+	maid:Give(menu.MouseButton1Up:Connect(function()
+		buttonActive(menu, false)
+	end))
+	maid:Give(menu.Activated:Connect(function()
+		buttonActive(menu, false)
+		UI.ToggleSettings(true)
+	end))
+
+	-- AlignToJumpButton / WatchTouchControls
+	local right = by["Mobile/Right"]
+	local function align(jump)
+		if jump:IsA("GuiObject") then
+			right.Size = jump.Size
+			right.Position = jump.Position
+		end
+	end
+	local function watchTouchGui(touchGui)
+		local frame = touchGui:FindFirstChild("TouchControlFrame")
+		if not (frame and frame:IsA("GuiObject")) then
+			return
+		end
+		local jump = frame:FindFirstChild("JumpButton")
+		if jump then
+			align(jump)
+		end
+		maid:Give(frame.ChildAdded:Connect(function(ch)
+			if ch.Name == "JumpButton" then
+				align(ch)
+			end
+		end))
+	end
+	local pg = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+	if pg then
+		local tg = pg:FindFirstChild("TouchGui")
+		if tg then
+			watchTouchGui(tg)
+		end
+		maid:Give(pg.ChildAdded:Connect(function(ch)
+			if ch.Name == "TouchGui" then
+				watchTouchGui(ch)
+			end
+		end))
+	end
+	Log.info("UI", "mobile buttons mounted (Crouch / POV / Menu)")
 end
 
 -- CharacterStatus.SetSpeed: floor to 0.1, comma format, resize Front to text width. No tween.
@@ -4729,6 +5138,10 @@ local function setupCharacter(model)
 	end
 	if ok and res then
 		App.Current = c
+		-- mobile crouch is a toggle, so keep its state across respawns
+		if UI.MobileCrouchDown and UI.MobileCrouchDown() then
+			c.Registry:Set("CrouchKey", true)
+		end
 	else
 		if not ok then
 			Log.warn("Character", "init error: " .. tostring(res))
@@ -4785,7 +5198,33 @@ local function bindInput()
 			UI.ToggleSettings()
 		end
 	end))
+	-- Mobile buttons (UI.BuildMobile) act on the current character through these handlers.
+	UI.MobileHandlers.Crouch = function(down)
+		local c = App.Current
+		if c then
+			c.Registry:Set("CrouchKey", down)
+		end
+	end
+	UI.MobileHandlers.ThirdPerson = function()
+		local c = App.Current
+		if c then
+			c.Camera:ToggleThirdPerson()
+		end
+	end
+	-- Touch camera: only touches that began outside GUI/thumbstick (processed == false) turn the camera.
+	local cameraTouches = {}
+	App.Maid:Give(UserInputService.InputBegan:Connect(function(input, processed)
+		if input.UserInputType == Enum.UserInputType.Touch and not processed then
+			cameraTouches[input] = true
+		end
+	end))
+	App.Maid:Give(UserInputService.InputEnded:Connect(function(input)
+		cameraTouches[input] = nil
+	end))
 	App.Maid:Give(UserInputService.InputChanged:Connect(function(input, processed)
+		if input.UserInputType == Enum.UserInputType.Touch and cameraTouches[input] and not Shared.SettingsOpen then
+			Shared.TouchDelta += Vector2.new(input.Delta.X, input.Delta.Y)
+		end
 		local c = App.Current
 		if not c then
 			return

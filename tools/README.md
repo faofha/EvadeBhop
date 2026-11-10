@@ -19,6 +19,10 @@ Run with `python3 -I` and keep downloaded place files in their own folder.
   `find(pattern)` (instance paths), `props(path, withDescendants)`, `source(path)` (script source), and
   `export(path)` (Luau constructor rows with non-default properties only). The `EVADE_HUD` table in
   `EvadeClone.lua` was generated with `export("ReplicatedStorage/Assets/UI/Game/HUD/Overlay/CharacterStatus")`.
+- `gen_ui_data.pl <dir>`: builds the `EVADE_UI` table in `EvadeClone.lua` (settings view, Slider,
+  Boolean, TopButton, TopExit, and the Crouch/POV/Menu mobile buttons) from `export()` dumps saved in
+  `<dir>` (`exp_view_settings.luau`, `exp_slider.luau`, `exp_boolean.luau`, `exp_topbutton.luau`,
+  `exp_topexit.luau`, `exp_mobile.luau`).
 
 ## `mocktest/`: headless mechanics test
 `./tools/mocktest/run.sh` concatenates `mock.lua` (minimal Roblox API mock: flat floor at Y=0,
