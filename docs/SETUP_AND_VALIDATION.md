@@ -124,7 +124,7 @@ appear:
 
 The right-hand group copies the size and position of Roblox's jump button, as in Evade. Jumping uses
 Roblox's touch jump button, and movement uses Roblox's thumbstick. If the PlayerModule loads late, the
-script attaches to it when it appears. In third person, dragging on the screen turns the camera.
+script attaches to it when it appears. In third person, dragging on open screen turns the camera at 1°/px (Roblox's touch speed). Drags that start on the joystick, the jump button or a mobile button are ignored, and the mouse is never locked on touch devices, because Roblox turns touches into emulated mouse movement.
 `CONFIG.UI.ForceMobile = true` shows the buttons on a PC for testing.
 
 ### Executor hygiene
