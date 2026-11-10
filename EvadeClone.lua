@@ -4358,6 +4358,18 @@ function UI.BuildSettings(maid, parent)
 			desc.Text = def.Desc or ""
 		end
 		inst.Center.Frame.Icon.Image = def.Icon
+		if def.Kind == "number" then
+			-- The knob lives inside the fill bar and Evade's template sizes it from the bar's width, so at the
+			-- minimum (FOV 70, the default) the fill is 0 wide and the knob vanished until dragged.  Size it
+			-- from the bar's height instead (same 2.5x scale, square), so it always shows.
+			local knob = inst.Center.Bar.Frame.Max.Bar.Frame
+			local arc = knob:FindFirstChildOfClass("UIAspectRatioConstraint")
+			if arc then
+				arc:Destroy()
+			end
+			knob.SizeConstraint = Enum.SizeConstraint.RelativeYY
+			knob.Size = UDim2.fromScale(2.5, 2.5)
+		end
 		local entry = { Instance = inst, Value = getSetting(def.Type), Type = def.Kind, VisualType = def.Type, Min = def.Min, Max = def.Max }
 		if def.Kind == "boolean" then
 			maid:Give(inst.Center.TextButton.Activated:Connect(function()
