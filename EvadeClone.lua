@@ -1706,11 +1706,28 @@ function Movement:SetJumpHeight(h)
 	end
 end
 
+-- The lift is capped by what is already pushing the character up: if anything else adds upward force
+-- (a second copy of this script, a leftover from an overlapping setup, a game's own VectorForce), ours
+-- shrinks so the total never exceeds mass * (game gravity - Evade gravity).  Otherwise two copies would
+-- lift more than the character weighs and it would rise forever after a jump.
 function Movement:UpdateGravityComp()
 	local gc = self.GravityComp
-	if gc and self.Stats.Gravity then
-		gc.Force = Vector3.new(0, self.Root.AssemblyMass * (workspace.Gravity - self.Stats.Gravity), 0)
+	if not (gc and self.Stats.Gravity) then
+		return
 	end
+	local root = self.Root
+	local target = root.AssemblyMass * (workspace.Gravity - self.Stats.Gravity)
+	local otherUp = 0
+	for _, d in self.Ctx.Character:GetDescendants() do
+		if d:IsA("VectorForce") and d ~= gc and d ~= self.Constraints.WallrunForce and d.Enabled then
+			local f = d.Force
+			if d.RelativeTo ~= Enum.ActuatorRelativeTo.World and d.Attachment0 then
+				f = d.Attachment0.WorldCFrame:VectorToWorldSpace(f)
+			end
+			otherUp += math.max(f.Y, 0)
+		end
+	end
+	gc.Force = Vector3.new(0, math.max(target - otherUp, 0), 0)
 end
 
 -- ---------- Init: humanoid state, constraints (Constraints.Init), registry defaults ----------
@@ -4691,13 +4708,25 @@ local function teardownCharacter()
 	end
 end
 
+-- Character:Init yields (waits for parts, loads animation files), so two setups can overlap, e.g. a
+-- respawn while the first is still loading. Without this token the older one could become current
+-- for a moment, get replaced without being destroyed, and leave its forces on the character (two
+-- gravity compensations -> the character rises forever).
+local setupToken = 0
 local function setupCharacter(model)
+	setupToken += 1
+	local token = setupToken
 	teardownCharacter()
 	if CONFIG.Mode ~= "CLONE" then
 		return
 	end
 	local c = Character.new(model)
 	local ok, res = pcall(c.Init, c)
+	if token ~= setupToken or LocalPlayer.Character ~= model then
+		-- a newer setup started (or the character changed) while this one was initialising
+		pcall(c.Destroy, c)
+		return
+	end
 	if ok and res then
 		App.Current = c
 	else
