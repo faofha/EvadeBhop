@@ -95,7 +95,21 @@ nothing depends on them. To hook the host game's own remotes, set these roles:
 
 ### Controls (Evade defaults)
 Jump `Space` / `ButtonA` (gamepad A held = auto-hop, as in Evade) · Crouch/slide hold `C` / `LeftControl` / `ButtonR2`
-· Third person `O` / `ButtonR3` · Validation `F8` · Unload `End`.
+· Third person `O` / `ButtonR3`, or scroll the mouse wheel out from first person (scroll in past 2 studs to
+return; the mouse turns the third-person camera directly, shift-lock style, no right-click needed)
+· Settings (FOV slider 70–100, saved to `EvadeClone/settings.json`) `P` · Validation `F8` · Unload `End`.
+
+### Gravity
+Evade runs at `workspace.Gravity = 50`. Most games use 196.2, which shortened airtime to about 0.44 s.
+`CONFIG.Movement.Gravity = 50` adds a VectorForce to your character only, so it falls as it does in
+Evade (airtime about 0.7 s), and the jump uses `JumpPower = sqrt(2·g·JumpHeight)`. Set it to `nil` to use
+the game's gravity.
+
+### In-game physics test
+`tools/ingame/physics_test.luau`: copy it to your executor workspace and run
+`loadstring(readfile("EvadeClone/physics_test.luau"))()` while EvadeClone is running. It builds a
+client-only test floor and wall, drives the inputs, and returns sprint, jump, airtime, bhop, air-strafe,
+slide, crouch and wallrun numbers.
 
 ---
 

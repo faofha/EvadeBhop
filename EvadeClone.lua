@@ -95,6 +95,10 @@ local CONFIG = {
 		AirStrafeAcceleration = 182,
 		AirAcceleration = 1,
 		JumpHeight = 3,
+		-- Evade's workspace.Gravity (MEASURED 50).  Other games usually run 196.2, which cut airtime to
+		-- ~0.44 s; a VectorForce on the character makes its effective gravity this value (nothing else in
+		-- the game is affected).  Set to nil to use the game's own gravity.
+		Gravity = 50,
 		JumpCap = 1,
 		WalkSpeedMultiplier = 1,
 		JumpSpeedMultiplier = 1.45,
@@ -132,13 +136,24 @@ local CONFIG = {
 	Keys = { -- MEASURED: Config/Player/Controls
 		Crouch = { Enum.KeyCode.C, Enum.KeyCode.LeftControl, Enum.KeyCode.ButtonR2 },
 		ThirdPerson = { Enum.KeyCode.O, Enum.KeyCode.ButtonR3 },
+		Settings = Enum.KeyCode.P, -- opens the settings panel (FOV slider)
 		GamepadJump = Enum.KeyCode.ButtonA,
 		Validation = Enum.KeyCode.F8,
 		Unload = Enum.KeyCode.End,
 	},
 
 	Camera = {
-		BaseFOV = 70, -- MEASURED: Settings FOV default 70 (range 70-100)
+		BaseFOV = 70, -- MEASURED: Settings FOV default 70 (range 70-100); set live from the settings panel
+		FOVMin = 70,
+		FOVMax = 100,
+		-- Third person is a script-driven shift-lock camera: the mouse turns it without right-click.
+		-- Scroll out from first person enters third person; scroll in past ThirdPersonMinZoom returns.
+		ThirdPersonMinZoom = 2,
+		ThirdPersonMaxZoom = 20,
+		ZoomStepFactor = 1.25, -- per wheel notch
+		ZoomRate = 12, -- zoom smoothing (1/s)
+		MaxPitch = math.rad(80), -- MEASURED: MaxY/MinY +-80
+		GamepadLookSpeed = Vector2.new(4.5, 3), -- rad/s at full right-stick deflection
 		SprintFOVMax = 1.1, -- MEASURED: lerp(1, 1.1, clamp((s-25)/8, 0, 1))
 		SprintFOVStart = 25,
 		SprintFOVRange = 8,
@@ -1647,6 +1662,31 @@ function Movement.new(ctx)
 	return self
 end
 
+-- Effective gravity for this character (Evade's 50 unless CONFIG.Movement.Gravity is nil).
+function Movement:Gravity()
+	return self.Stats.Gravity or workspace.Gravity
+end
+
+-- Humanoid derives jump speed from workspace.Gravity, so with a custom gravity give it the
+-- equivalent JumpPower: v = sqrt(2 * g * h).
+function Movement:SetJumpHeight(h)
+	local hum = self.Humanoid
+	if self.Stats.Gravity then
+		hum.UseJumpPower = true
+		hum.JumpPower = math.sqrt(2 * self.Stats.Gravity * h)
+	else
+		hum.UseJumpPower = false
+		hum.JumpHeight = h
+	end
+end
+
+function Movement:UpdateGravityComp()
+	local gc = self.GravityComp
+	if gc and self.Stats.Gravity then
+		gc.Force = Vector3.new(0, self.Root.AssemblyMass * (workspace.Gravity - self.Stats.Gravity), 0)
+	end
+end
+
 -- ---------- Init: humanoid state, constraints (Constraints.Init), registry defaults ----------
 function Movement:Init(maid)
 	local hum, root = self.Humanoid, self.Root
@@ -1654,8 +1694,7 @@ function Movement:Init(maid)
 		pcall(hum.SetStateEnabled, hum, st, false)
 	end
 	pcall(function()
-		hum.UseJumpPower = false
-		hum.JumpHeight = self.Stats.JumpHeight
+		self:SetJumpHeight(self.Stats.JumpHeight)
 		hum.WalkSpeed = 0 -- MEASURED: StarterPlayer.CharacterWalkSpeed = 0
 		hum.AutoRotate = false -- root yaw is driven by RootPartOrienter every frame
 	end)
@@ -1689,7 +1728,19 @@ function Movement:Init(maid)
 	vf.Parent = root
 	maid:Give(vf)
 
+	-- GravityComp: lifts the character by (game gravity - Evade gravity) so it falls like in Evade.
+	local gc = Instance.new("VectorForce")
+	gc.Name = "EvadeClone_GravityComp"
+	gc.Attachment0 = att
+	gc.RelativeTo = Enum.ActuatorRelativeTo.World
+	gc.ApplyAtCenterOfMass = true
+	gc.Force = Vector3.zero
+	gc.Enabled = self.Stats.Gravity ~= nil
+	gc.Parent = root
+	maid:Give(gc)
+
 	self.Constraints = { BaseMover = lv, WallrunForce = vf }
+	self.GravityComp = gc
 
 	self.GroundParams = RaycastParams.new()
 	self.GroundParams.FilterType = Enum.RaycastFilterType.Exclude
@@ -2020,7 +2071,7 @@ function MoveFunctions.Air(self, dt, info)
 	V = self:WallImpact(V)
 	local constraints = { BaseMover = { PlaneVelocity = Vector2.new(V.X, V.Z) } }
 	if info.Wallrunning then
-		constraints.WallrunForce = { Force = Vector3.new(0, self.Root.AssemblyMass * workspace.Gravity * 0.5, 0) }
+		constraints.WallrunForce = { Force = Vector3.new(0, self.Root.AssemblyMass * self:Gravity() * 0.5, 0) }
 	end
 	return constraints, { Sprint = antiNan(clamp(sprint, 1, stats.SprintCap or 2)), Velocity = V }
 end
@@ -2244,7 +2295,7 @@ function Movement:Jump(stats, fromGround, heightOverride)
 			R:Set("Velocity", (V * Vector3.new(1, 0, 1)).Unit * newMag)
 		end
 	end
-	self.Humanoid.JumpHeight = heightOverride or stats.JumpHeight
+	self:SetJumpHeight(heightOverride or stats.JumpHeight)
 	self.Humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
 	self.JumpCount += 1
 	if self.State == "WallrunRight" or self.State == "WallrunLeft" then
@@ -2291,6 +2342,7 @@ function Movement:Update(dt)
 		return
 	end
 	self.Disabled = hum.Health <= 0
+	self:UpdateGravityComp()
 	R:Set("JumpingActive", self.JumpHeldDown == true)
 	if self.Disabled then
 		self:SetState("Inert")
@@ -2373,6 +2425,9 @@ end
 --==============================================================================
 -- SECTION 11 : CAMERA  (CameraService FOV + ViewmodelDeviation Camera/Grounded springs + camera type)
 --==============================================================================
+-- State shared between the camera and the settings panel (UI is declared later in the file).
+local Shared = { SettingsOpen = false, ThirdPersonZoom = nil }
+
 local CameraFX = {}
 CameraFX.__index = CameraFX
 
@@ -2389,6 +2444,11 @@ function CameraFX.new(ctx)
 		ThirdPerson = CONFIG.Camera.StartThirdPerson,
 		Offset = CFrame.identity,
 		Roll = 0,
+		Yaw = 0,
+		Pitch = 0,
+		Zoom = Shared.ThirdPersonZoom or CONFIG.Camera.ThirdPersonZoom, -- remembered across respawns
+		ZoomCurrent = CONFIG.Camera.FirstPersonZoom,
+		GamepadLook = Vector2.zero,
 	}, CameraFX)
 end
 
@@ -2398,6 +2458,7 @@ function CameraFX:Init(maid)
 	self.Saved = {
 		FieldOfView = cam.FieldOfView,
 		CameraMode = LocalPlayer.CameraMode,
+		CameraType = cam.CameraType,
 		MinZoom = LocalPlayer.CameraMinZoomDistance,
 		MaxZoom = LocalPlayer.CameraMaxZoomDistance,
 		CameraOffset = hum.CameraOffset,
@@ -2410,12 +2471,31 @@ function CameraFX:Init(maid)
 end
 
 -- Camera type switch (Character/Client/Camera.Change): zoom, CameraMode, offsets, tween 0.16 s Sine InOut.
+-- Third person is driven by UpdateThirdPerson (Scriptable camera); first person stays on Roblox's
+-- camera in LockFirstPerson, which already turns with the mouse.
 function CameraFX:ApplyCameraType(instant)
-	local zoom = self.ThirdPerson and CONFIG.Camera.ThirdPersonZoom or CONFIG.Camera.FirstPersonZoom
-	LocalPlayer.CameraMode = self.ThirdPerson and Enum.CameraMode.Classic or Enum.CameraMode.LockFirstPerson
+	local cam = workspace.CurrentCamera
 	if self.ZoomTween then
 		self.ZoomTween:Cancel()
 		self.ZoomTween = nil
+	end
+	if self.ThirdPerson then
+		local pitch, yaw = cam.CFrame:ToOrientation()
+		self.Pitch = clamp(pitch, -CONFIG.Camera.MaxPitch, CONFIG.Camera.MaxPitch)
+		self.Yaw = yaw
+		self.ZoomCurrent = instant and self.Zoom or CONFIG.Camera.FirstPersonZoom
+		LocalPlayer.CameraMode = Enum.CameraMode.Classic
+		cam.CameraType = Enum.CameraType.Scriptable
+		return
+	end
+	-- back to first person: hand the camera to Roblox from where the third-person camera is looking,
+	-- zooming in from the current distance.
+	cam.CameraType = Enum.CameraType.Custom
+	LocalPlayer.CameraMode = Enum.CameraMode.LockFirstPerson
+	local zoom = CONFIG.Camera.FirstPersonZoom
+	if not instant and self.ZoomCurrent > zoom then
+		LocalPlayer.CameraMaxZoomDistance = self.ZoomCurrent
+		LocalPlayer.CameraMinZoomDistance = self.ZoomCurrent
 	end
 	local function setZoom(z)
 		if z >= LocalPlayer.CameraMaxZoomDistance then
@@ -2448,17 +2528,86 @@ function CameraFX:ToggleThirdPerson()
 	self:ApplyCameraType(false)
 end
 
--- Per-frame camera-type upkeep (Camera:Update): shift-lock offset + crouch eye height.
--- ESTIMATED adaptation: Evade's custom camera applies OriginOffset (0,0.21,0) / ShiftLockOffset (2,0.5,0);
--- here they go into Humanoid.CameraOffset, plus the emulated hull drop (rootY - 4) / 2.
+-- Mouse wheel: scroll out from first person -> third person; in third person it zooms, and scrolling
+-- in past ThirdPersonMinZoom returns to first person (Roblox-style).
+function CameraFX:OnWheel(z)
+	local c = CONFIG.Camera
+	if not self.ThirdPerson then
+		if z < 0 then
+			self.Zoom = c.ThirdPersonZoom
+			Shared.ThirdPersonZoom = self.Zoom
+			self:ToggleThirdPerson()
+		end
+		return
+	end
+	local nz = z > 0 and self.Zoom / c.ZoomStepFactor or self.Zoom * c.ZoomStepFactor
+	if nz < c.ThirdPersonMinZoom - 1e-3 then
+		self:ToggleThirdPerson()
+		return
+	end
+	self.Zoom = clamp(nz, c.ThirdPersonMinZoom, c.ThirdPersonMaxZoom)
+	Shared.ThirdPersonZoom = self.Zoom
+end
+
+-- Third person: shift-lock style camera (Evade ShiftLockOffset (2, 0.5, 0)), mouse turns it directly.
+-- Runs before the frame reads LookCFrame, so movement uses this frame's camera direction.
+function CameraFX:UpdateThirdPerson(dt)
+	local cam = workspace.CurrentCamera
+	local c = CONFIG.Camera
+	if cam.CameraType ~= Enum.CameraType.Scriptable then
+		cam.CameraType = Enum.CameraType.Scriptable
+	end
+	if not Shared.SettingsOpen then
+		UserInputService.MouseBehavior = Enum.MouseBehavior.LockCenter
+		local d = UserInputService:GetMouseDelta()
+		local sens = 1
+		pcall(function()
+			sens = UserSettings():GetService("UserGameSettings").MouseSensitivity
+		end)
+		local perPixel = math.rad(0.5) * sens -- Roblox CameraInput mouse speed
+		self.Yaw -= d.X * perPixel
+		self.Pitch -= d.Y * perPixel * 0.77
+		local g = self.GamepadLook
+		if g.Magnitude > 0.15 then
+			self.Yaw -= g.X * c.GamepadLookSpeed.X * dt
+			self.Pitch += g.Y * c.GamepadLookSpeed.Y * dt
+		end
+		self.Pitch = clamp(self.Pitch, -c.MaxPitch, c.MaxPitch)
+	end
+	self.ZoomCurrent = lerp(self.ZoomCurrent, self.Zoom, math.min(dt * c.ZoomRate, 1))
+	local ctx = self.Ctx
+	local drop = (ctx.RootSize.Y - CONFIG.Hull.StandSize.Y * ctx.SizeScale) / 2
+	local focus = ctx.Root.Position + Vector3.new(0, 1.5 + drop, 0)
+	local rot = CFrame.fromOrientation(self.Pitch, self.Yaw, 0)
+	local pivot = CFrame.new(focus) * rot * CFrame.new(c.ThirdPersonShiftLockOffset * math.min(self.ZoomCurrent / c.ThirdPersonZoom, 1))
+	local desired = pivot * CFrame.new(0, 0, self.ZoomCurrent)
+	-- keep the camera out of walls
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = { ctx.Character }
+	local dir = desired.Position - focus
+	local hit = dir.Magnitude > 1e-3 and workspace:Raycast(focus, dir, params)
+	if hit then
+		desired = rot + (hit.Position - dir.Unit * 0.3)
+	end
+	cam.CFrame = desired
+	-- Roblox's first-person camera hides the character via LocalTransparencyModifier and stops
+	-- updating it while the camera is Scriptable, so show the body again here.
+	for _, d in ctx.Character:GetDescendants() do
+		if (d:IsA("BasePart") or d:IsA("Decal")) and d.LocalTransparencyModifier ~= 0 then
+			d.LocalTransparencyModifier = 0
+		end
+	end
+end
+
+-- Per-frame camera-type upkeep (Camera:Update): first-person eye offset + crouch eye height.
+-- ESTIMATED adaptation: Evade's custom camera applies OriginOffset (0,0.21,0); here it goes into
+-- Humanoid.CameraOffset, plus the emulated hull drop (rootY - 4) / 2.  Third person applies its own
+-- offsets in UpdateThirdPerson.
 function CameraFX:UpdateType()
 	local ctx = self.Ctx
 	local drop = (ctx.RootSize.Y - CONFIG.Hull.StandSize.Y * ctx.SizeScale) / 2
-	local base = self.ThirdPerson and CONFIG.Camera.ThirdPersonShiftLockOffset or CONFIG.Camera.CameraOffset
-	ctx.Humanoid.CameraOffset = base + Vector3.new(0, drop, 0)
-	if self.ThirdPerson then
-		UserInputService.MouseBehavior = Enum.MouseBehavior.LockCenter
-	end
+	ctx.Humanoid.CameraOffset = self.ThirdPerson and Vector3.zero or (CONFIG.Camera.CameraOffset + Vector3.new(0, drop, 0))
 end
 
 -- CameraService.Update: FieldOfView = BaseFOV * product(adjusters). Written BEFORE the springs update the
@@ -2586,6 +2735,7 @@ function CameraFX:Restore()
 	end
 	pcall(function()
 		workspace.CurrentCamera.FieldOfView = s.FieldOfView
+		workspace.CurrentCamera.CameraType = s.CameraType == Enum.CameraType.Scriptable and Enum.CameraType.Custom or s.CameraType
 		LocalPlayer.CameraMode = s.CameraMode
 		LocalPlayer.CameraMaxZoomDistance = math.max(s.MaxZoom, s.MinZoom)
 		LocalPlayer.CameraMinZoomDistance = s.MinZoom
@@ -3791,6 +3941,136 @@ function UI.Init(maid)
 	end
 	Log.info("UI", ("HUD from %s mounted in %s"):format(source, how))
 	UI.Speed, UI.HealthValue = nil, nil
+	UI.BuildSettings(maid, parent)
+end
+
+--------------------------------------------------------------------------------
+-- Settings panel (P): FOV slider 70-100 (Evade's FOV setting).  Saved to <Root>/settings.json.
+-- The panel's Modal button frees the mouse while it is open, in first and third person.
+--------------------------------------------------------------------------------
+local SETTINGS_FILE = "settings.json"
+
+function UI.LoadSettings()
+	local text = Assets.ReadFile(Assets.Path(SETTINGS_FILE))
+	if not text then
+		return
+	end
+	local ok, data = pcall(function()
+		return game:GetService("HttpService"):JSONDecode(text)
+	end)
+	if ok and type(data) == "table" and tonumber(data.FOV) then
+		CONFIG.Camera.BaseFOV = clamp(tonumber(data.FOV), CONFIG.Camera.FOVMin, CONFIG.Camera.FOVMax)
+	end
+end
+
+function UI.SaveSettings()
+	local ok, text = pcall(function()
+		return game:GetService("HttpService"):JSONEncode({ FOV = CONFIG.Camera.BaseFOV })
+	end)
+	if ok then
+		Assets.WriteFile(Assets.Path(SETTINGS_FILE), text)
+	end
+end
+
+function UI.BuildSettings(maid, parent)
+	local c = CONFIG.Camera
+	local gui = make("ScreenGui", { Name = "EvadeClone_Settings", ResetOnSpawn = false, Enabled = false, DisplayOrder = 10, ZIndexBehavior = Enum.ZIndexBehavior.Global })
+	local panel = make("TextButton", {
+		Name = "Panel", Text = "", AutoButtonColor = false, Modal = true, -- Modal frees the locked mouse
+		AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5), Size = UDim2.fromOffset(360, 150),
+		BackgroundColor3 = Color3.fromRGB(20, 20, 24), BackgroundTransparency = 0.1, BorderSizePixel = 0,
+	}, { corner(0, 12), make("UIStroke", { Color = Color3.fromRGB(255, 255, 255), Transparency = 0.85, Thickness = 1 }) })
+	panel.Parent = gui
+	local function label(props)
+		props.BackgroundTransparency = 1
+		props.FontFace = GOTHAM_BOLD
+		props.TextColor3 = props.TextColor3 or Color3.fromRGB(235, 235, 240)
+		local l = make("TextLabel", props)
+		l.Parent = panel
+		return l
+	end
+	label({ Text = "SETTINGS", TextSize = 18, TextXAlignment = Enum.TextXAlignment.Left, Position = UDim2.fromOffset(20, 14), Size = UDim2.fromOffset(200, 22) })
+	local close = make("TextButton", {
+		Text = "X", TextSize = 16, FontFace = GOTHAM_BOLD, TextColor3 = Color3.fromRGB(200, 200, 205), AutoButtonColor = true,
+		AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, -12, 0, 10), Size = UDim2.fromOffset(28, 28),
+		BackgroundColor3 = Color3.fromRGB(45, 45, 52), BorderSizePixel = 0,
+	}, { corner(0, 6) })
+	close.Parent = panel
+	label({ Text = "Field of View", TextSize = 15, TextXAlignment = Enum.TextXAlignment.Left, Position = UDim2.fromOffset(20, 56), Size = UDim2.fromOffset(200, 20) })
+	local valueText = label({ Text = "", TextSize = 15, TextXAlignment = Enum.TextXAlignment.Right, AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, -20, 0, 56), Size = UDim2.fromOffset(80, 20), TextColor3 = Color3.fromRGB(112, 255, 73) })
+	local bar = make("TextButton", {
+		Name = "Bar", Text = "", AutoButtonColor = false, Position = UDim2.fromOffset(20, 92), Size = UDim2.new(1, -40, 0, 10),
+		BackgroundColor3 = Color3.fromRGB(60, 60, 70), BorderSizePixel = 0,
+	}, { corner(1, 0) })
+	bar.Parent = panel
+	local fill = make("Frame", { BackgroundColor3 = Color3.fromRGB(112, 255, 73), BorderSizePixel = 0, Size = UDim2.fromScale(0, 1) }, { corner(1, 0) })
+	fill.Parent = bar
+	local knob = make("Frame", {
+		AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0, 0.5), Size = UDim2.fromOffset(18, 18),
+		BackgroundColor3 = Color3.fromRGB(255, 255, 255), BorderSizePixel = 0, ZIndex = 2,
+	}, { corner(1, 0) })
+	knob.Parent = bar
+	label({ Text = ("%d"):format(c.FOVMin), TextSize = 12, TextColor3 = Color3.fromRGB(140, 140, 150), TextXAlignment = Enum.TextXAlignment.Left, Position = UDim2.fromOffset(20, 110), Size = UDim2.fromOffset(40, 16) })
+	label({ Text = ("%d"):format(c.FOVMax), TextSize = 12, TextColor3 = Color3.fromRGB(140, 140, 150), TextXAlignment = Enum.TextXAlignment.Right, AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, -20, 0, 110), Size = UDim2.fromOffset(40, 16) })
+
+	local function render()
+		local a = (c.BaseFOV - c.FOVMin) / (c.FOVMax - c.FOVMin)
+		fill.Size = UDim2.fromScale(a, 1)
+		knob.Position = UDim2.fromScale(a, 0.5)
+		valueText.Text = ("%d"):format(c.BaseFOV)
+	end
+	local function setFromX(x)
+		local a = clamp((x - bar.AbsolutePosition.X) / math.max(bar.AbsoluteSize.X, 1), 0, 1)
+		c.BaseFOV = math.floor(c.FOVMin + a * (c.FOVMax - c.FOVMin) + 0.5)
+		render()
+	end
+	local dragging = false
+	maid:Give(bar.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = true
+			setFromX(input.Position.X)
+		end
+	end))
+	maid:Give(UserInputService.InputChanged:Connect(function(input)
+		if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+			setFromX(input.Position.X)
+		end
+	end))
+	maid:Give(UserInputService.InputEnded:Connect(function(input)
+		if dragging and (input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch) then
+			dragging = false
+			UI.SaveSettings()
+		end
+	end))
+	maid:Give(close.MouseButton1Click:Connect(function()
+		UI.ToggleSettings(false)
+	end))
+	render()
+	gui.Parent = parent
+	maid:Give(gui)
+	maid:Give(function()
+		Shared.SettingsOpen = false
+	end)
+	UI.SettingsGui = gui
+	UI.RenderSettings = render
+end
+
+function UI.ToggleSettings(open)
+	local gui = UI.SettingsGui
+	if not gui then
+		return
+	end
+	if open == nil then
+		open = not gui.Enabled
+	end
+	gui.Enabled = open
+	Shared.SettingsOpen = open
+	if open then
+		UserInputService.MouseBehavior = Enum.MouseBehavior.Default
+		UI.RenderSettings()
+	else
+		UI.SaveSettings()
+	end
 end
 
 -- CharacterStatus.SetSpeed: floor to 0.1, comma format, resize Front to text width. No tween.
@@ -3989,6 +4269,9 @@ function Character:Update(dt)
 	end
 	local R = self.Registry
 	local cam = workspace.CurrentCamera
+	if self.Camera.ThirdPerson then
+		self.Camera:UpdateThirdPerson(dt)
+	end
 	R:Set("Health", self.HealthOverride or self.Humanoid.Health)
 	R:Set("LookCFrame", cam.CFrame)
 	local av = self.Root.AssemblyLinearVelocity
@@ -4384,6 +4667,22 @@ local function bindInput()
 			c.Camera:ToggleThirdPerson()
 		end
 	end))
+	App.Maid:Give(UserInputService.InputBegan:Connect(function(input, processed)
+		if input.KeyCode == CONFIG.Keys.Settings and not processed then
+			UI.ToggleSettings()
+		end
+	end))
+	App.Maid:Give(UserInputService.InputChanged:Connect(function(input, processed)
+		local c = App.Current
+		if not c then
+			return
+		end
+		if input.UserInputType == Enum.UserInputType.MouseWheel and not processed and not Shared.SettingsOpen then
+			c.Camera:OnWheel(input.Position.Z)
+		elseif input.KeyCode == Enum.KeyCode.Thumbstick2 then
+			c.Camera.GamepadLook = Vector2.new(input.Position.X, input.Position.Y)
+		end
+	end))
 	App.Maid:Give(UserInputService.InputEnded:Connect(function(input)
 		local c = App.Current
 		if not c then
@@ -4446,8 +4745,14 @@ end
 
 local function main()
 	capabilityReport()
-	GENV.EvadeClone = { Unload = unload, Config = CONFIG, Version = VERSION, Validation = Validation }
+	GENV.EvadeClone = {
+		Unload = unload, Config = CONFIG, Version = VERSION, Validation = Validation,
+		Current = function() -- debug/testing: the live Character (Camera, Movement, Registry, ...)
+			return App.Current
+		end,
+	}
 	Assets.EnsureFolders()
+	UI.LoadSettings()
 	Assets.DownloadAnimations()
 	Assets.LoadEvadeTrackLengths()
 	Assets.FootstepOverrides = Assets.LoadFootstepOverrides()
