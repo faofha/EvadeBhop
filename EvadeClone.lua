@@ -64,6 +64,7 @@ local ReplicatedStorage = getService("ReplicatedStorage")
 local TweenService = getService("TweenService")
 local Debris = getService("Debris")
 local HttpService = getService("HttpService")
+local ContextActionService = getService("ContextActionService")
 local LocalPlayer = Players.LocalPlayer
 
 -- Random instance names (32 hex chars, new each run) for everything this script creates, so the GUIs and
@@ -5364,8 +5365,25 @@ function UI.ToggleEmoteWheel(open)
 	if UI.EmoteModal then
 		UI.EmoteModal.Modal = open -- frees the locked mouse in first person
 	end
+	-- While open, 1-6 and the page key belong to the wheel: bound at high priority and sunk, so the
+	-- Roblox hotbar (also on 1-9) doesn't equip a tool at the same time.
+	UI.EmoteActionName = UI.EmoteActionName or hiddenName()
 	if open then
 		UserInputService.MouseBehavior = Enum.MouseBehavior.Default
+		local keys = { Enum.KeyCode.One, Enum.KeyCode.Two, Enum.KeyCode.Three, Enum.KeyCode.Four, Enum.KeyCode.Five, Enum.KeyCode.Six }
+		for _, k in CONFIG.Keys.EmotePage do
+			table.insert(keys, k)
+		end
+		pcall(function()
+			ContextActionService:BindActionAtPriority(UI.EmoteActionName, function(_, state, input)
+				if state == Enum.UserInputState.Begin then
+					UI.EmoteWheelKey(input)
+				end
+				return Enum.ContextActionResult.Sink
+			end, false, Enum.ContextActionPriority.High.Value + 1000, table.unpack(keys))
+		end)
+	else
+		pcall(ContextActionService.UnbindAction, ContextActionService, UI.EmoteActionName)
 	end
 end
 
@@ -6010,9 +6028,7 @@ local function bindInput()
 		elseif isKey(CONFIG.Keys.ThirdPerson, input) then
 			c.Camera:ToggleThirdPerson()
 		elseif isKey(CONFIG.Keys.Emote, input) then
-			UI.MobileHandlers.Emote()
-		else
-			UI.EmoteWheelKey(input)
+			UI.MobileHandlers.Emote() -- wheel keys (1-6, page) are bound while it is open (UI.ToggleEmoteWheel)
 		end
 	end))
 	-- Emote key (MEASURED CanActivate): while emoting it stops the emote; otherwise it opens or closes the
