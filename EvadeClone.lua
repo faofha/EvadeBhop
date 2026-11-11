@@ -3266,6 +3266,8 @@ function KPTrack:SyncMirror(force)
 		pcall(function()
 			if playing then
 				m:Play(DEFAULT_FADE, math.max(self.WeightTarget, 0.001), self.Speed)
+				-- Play()'s weight argument does not replicate; AdjustWeight does.
+				m:AdjustWeight(math.max(self.WeightTarget, 0.001), DEFAULT_FADE)
 			else
 				m:Stop(DEFAULT_FADE)
 			end
@@ -3572,7 +3574,7 @@ function Sync.Init(appMaid)
 		for _, at in tracks do
 			local anim = at.Animation
 			local id = anim and string.match(anim.AnimationId, "(%d+)$")
-			if id and idMap[id] then
+			if id and idMap[id] and at.WeightTarget > 0 then
 				seen[id] = at
 			end
 		end
@@ -3591,7 +3593,7 @@ function Sync.Init(appMaid)
 				t = r.kp:NewTrack(idMap[id], "sync" .. id)
 				r.tracks[id] = t
 			end
-			local w, s = math.max(at.WeightTarget, 0.001), at.Speed
+			local w, s = at.WeightTarget, at.Speed
 			if not r.playing[id] then
 				r.playing[id] = true
 				t:Play(cfg.RemoteFade, w, s)
