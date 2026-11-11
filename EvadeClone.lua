@@ -64,6 +64,7 @@ local ReplicatedStorage = getService("ReplicatedStorage")
 local TweenService = getService("TweenService")
 local Debris = getService("Debris")
 local HttpService = getService("HttpService")
+local ContextActionService = getService("ContextActionService")
 local LocalPlayer = Players.LocalPlayer
 
 -- Random instance names (32 hex chars, new each run) for everything this script creates, so the GUIs and
@@ -159,6 +160,8 @@ local CONFIG = {
 		Crouch = { Enum.KeyCode.C, Enum.KeyCode.LeftControl, Enum.KeyCode.ButtonR2 },
 		ThirdPerson = { Enum.KeyCode.O, Enum.KeyCode.ButtonR3 },
 		Settings = Enum.KeyCode.P, -- opens the settings panel (FOV slider)
+		Emote = { Enum.KeyCode.G, Enum.KeyCode.DPadUp }, -- MEASURED: Controls "Emote"
+		EmotePage = { Enum.KeyCode.Q }, -- MEASURED: wheel page key is the "Melee" bind ([Q] in the template)
 		GamepadJump = Enum.KeyCode.ButtonA,
 		Validation = Enum.KeyCode.F8,
 		Unload = Enum.KeyCode.End,
@@ -245,6 +248,27 @@ local CONFIG = {
 		RemoteFade = 0.15, -- fade used on the receiving side
 	},
 
+	-- Emotes (Evade HUD/Interactors/Popups/Emote): G opens the wheel, 1-6 pick a slot, Q flips to page 2,
+	-- G again while emoting stops the emote.  Each clip is Evade's AnimationClassic (R6) KeyframeSequence,
+	-- saved as Animations/<File>; the trailing number is its Evade ID, which Sync uses so other script
+	-- users see the emote and hear its sound.  SpeedMult and Sound are MEASURED (BaseItems/Emotes).
+	-- Up to 12 slots (two pages of 6), in wheel order.
+	Emotes = {
+		Enabled = true,
+		Cooldown = 1.5, -- MEASURED: Emote popup CanActivate (tick() - LastActivated <= 1.5)
+		Volume = 1, -- Evade EmoteVolume setting (0-1)
+		List = {
+			{ Name = "Stride", File = "Stride_R6_Converted_83021322945282.rbxm", SpeedMult = 0.3, Sound = 1844684317 },
+			{ Name = "SwagWalk", File = "SwagWalk_R6_Converted_80539291158095.rbxm", SpeedMult = 0.3, Sound = 9042679995 },
+			{ Name = "BoldMarch", File = "BoldMarch_R6_Converted_89755710041366.rbxm", SpeedMult = 0.5, Sound = 11010019801 },
+			{ Name = "Smug", File = "Smug_R6_Converted_80026702634826.rbxm", SpeedMult = 0.2, Sound = 80411553292618 },
+			{ Name = "Caramelldansen", File = "Caramelldansen_R6_Converted_110855399872700.rbxm", SpeedMult = 0, Sound = 1837749140 },
+			{ Name = "Carlton", File = "Carlton_R6_Converted_133342001252138.rbxm", SpeedMult = 0, Sound = 7214835508 },
+			{ Name = "Gmod", File = "Gmod_R6_Converted_138311974981291.rbxm", SpeedMult = 0, Sound = 1847228473 },
+			{ Name = "Clap", File = "Clap_R6_Converted_130422022353171.rbxm", SpeedMult = 0, Sound = 9114762437 },
+		},
+	},
+
 	Remotes = {
 		-- "Count" = listen-only, outgoing registry terms are counted, never sent (default, safe).
 		-- "Fire"  = FireServer(table) on the mapped outgoing remote (only for remotes YOU own).
@@ -269,7 +293,7 @@ local CONFIG = {
 local EVADE = {}
 
 -- Shared/StateInfo (subset relevant outside Evade's map-specific systems: ladders, water, carry,
--- emotes, downed, vehicles are skipped). Order and priorities are verbatim; first-highest wins.
+-- downed, vehicles are skipped). Order and priorities are verbatim; first-highest wins.
 EVADE.States = {
 	{
 		State = "Idle", Priority = 0, Animation = "Idle",
@@ -316,6 +340,27 @@ EVADE.States = {
 		State = "Air", Priority = 1, Animation = "Jumping", ViewmodelAnimationType = "Air",
 		Requirements = { Grounded = false },
 		Movement = { MoveType = "Air", Constraints = { "BaseMover" }, RootPartOrientation = "Camera" },
+	},
+	-- Emoting (Animation "Default" = no base animations; the emote clip plays on its own)
+	{
+		State = "Emoting", Priority = 5, Animation = "Default", ViewmodelAnimationType = "Air", Camera = "Emote",
+		Requirements = { Grounded = true, Emoting = true },
+		Movement = { MoveType = "Run", Constraints = { "BaseMover" }, RootPartOrientation = "EmotingMoveDir", DisableSprinting = true },
+	},
+	{
+		State = "EmotingAir", Priority = 5, Animation = "Default", ViewmodelAnimationType = "Air", Camera = "Emote",
+		Requirements = { Grounded = false, Emoting = true },
+		Movement = { MoveType = "Air", Constraints = { "BaseMover" }, RootPartOrientation = "EmotingMoveDir", DisableSprinting = true },
+	},
+	{
+		State = "EmotingSlide", Priority = 6, Animation = "Default", ViewmodelAnimationType = "Slide", Camera = "Emote",
+		Requirements = { RelativeSpeedTest = { ">", 19 }, Grounded = true, Crouching = true, Emoting = true },
+		Movement = { MoveType = "Slide", Constraints = { "BaseMover" }, RootPartOrientation = "EmotingMoveDir", DisableSprinting = true, BreakDoors = true },
+	},
+	{
+		State = "EmotingSlideAir", Priority = 7, Animation = "Default", ViewmodelAnimationType = "Slide", Camera = "Emote",
+		Requirements = { RelativeSpeedTest = { ">", 19 }, Grounded = false, Crouching = true, Emoting = true },
+		Movement = { MoveType = "Air", Constraints = { "BaseMover" }, RootPartOrientation = "EmotingMoveDir", DisableSprinting = true, BreakDoors = true },
 	},
 }
 EVADE.StateByName = {}
@@ -1264,7 +1309,14 @@ function Assets.DownloadAnimations()
 		return
 	end
 	local seen, fetched, failed = {}, 0, 0
+	local files = {}
 	for _, fileName in AnimationMap do
+		table.insert(files, fileName)
+	end
+	for _, e in CONFIG.Emotes.List do
+		table.insert(files, e.File)
+	end
+	for _, fileName in files do
 		if type(fileName) == "string" and not seen[fileName] then
 			seen[fileName] = true
 			local path = Assets.Path("Animations", fileName)
@@ -2215,6 +2267,9 @@ local Requirement = {
 		end
 		return w == want
 	end,
+	Emoting = function(R, want)
+		return ((R:Get("Emote") or 0) ~= 0) == want
+	end,
 }
 function Movement:FindBestState()
 	local bestState, bestPriority
@@ -2403,6 +2458,26 @@ function Movement:Orient()
 	if mv.RootPartOrientation == "Camera" then
 		local _, yaw, _ = self.R:Get("LookCFrame"):ToOrientation()
 		root.CFrame = CFrame.new(root.Position) * CFrame.Angles(0, yaw, 0)
+	elseif mv.RootPartOrientation == "EmotingMoveDir" then
+		-- MEASURED Orienter EmotingMoveDir: turn toward the camera-relative move direction (forward input
+		-- is ignored in the air) at lerp clamp(dt * 20.5); keep the last direction when not moving.
+		local md = self.R:Get("MoveDirection")
+		if md and not self.R:Get("Grounded") and md.Z < 0 then
+			md = Vector3.new(md.X, md.Y, 0)
+		end
+		if md and md ~= Vector3.zero then
+			local w = self.R:Get("LookCFrame"):VectorToWorldSpace(md)
+			w = Vector3.new(w.X, 0, w.Z)
+			if w.Magnitude > 1e-4 then
+				self.LastMoveDirection = w
+			end
+		end
+		if self.LastMoveDirection then
+			local goal = CFrame.lookAt(Vector3.zero, self.LastMoveDirection.Unit)
+			local cur = root.CFrame - root.CFrame.Position
+			local rot = cur:Lerp(goal, clamp((self.OrientDt or 1 / 60) * 20.5, 0, 1))
+			root.CFrame = CFrame.new(root.Position) * rot
+		end
 	elseif mv.RootPartOrientation == "Velocity" then
 		local V = self.R:Get("Velocity")
 		if V == nil or flat(V).Magnitude < 1e-4 then
@@ -2481,6 +2556,7 @@ function Movement:Update(dt)
 	R:Set("RelativeSpeed", baseSpeed > 0 and speed / (baseSpeed / 1500) or 0)
 	local rel = (V == Vector3.zero) and Vector3.zero or (root.CFrame - root.CFrame.Position):VectorToObjectSpace(V.Unit)
 	R:Set("RelativeMoveDirection", rel)
+	self.OrientDt = dt
 	self:Orient()
 end
 
@@ -2503,7 +2579,11 @@ end
 -- SECTION 11 : CAMERA  (CameraService FOV + ViewmodelDeviation Camera/Grounded springs + camera type)
 --==============================================================================
 -- State shared between the camera and the settings panel (UI is declared later in the file).
-local Shared = { SettingsOpen = false, TouchDelta = Vector2.zero }
+local Shared = { SettingsOpen = false, EmoteWheelOpen = false, TouchDelta = Vector2.zero }
+-- A menu that needs the mouse (settings panel or emote wheel) is open.
+local function menuOpen()
+	return Shared.SettingsOpen or Shared.EmoteWheelOpen
+end
 
 -- Touch-only device (phone/tablet without keyboard), or forced for testing.  On these the mouse must NOT
 -- be locked: Roblox turns touches (including the joystick drag) into emulated mouse movement, so a
@@ -2615,8 +2695,31 @@ function CameraFX:ApplyCameraType(instant)
 end
 
 function CameraFX:ToggleThirdPerson()
+	if self.Emoting then
+		return -- the Emote camera type is fixed while emoting
+	end
 	self.ThirdPerson = not self.ThirdPerson
 	self:ApplyCameraType(false)
+end
+
+-- MEASURED Camera/Types "Emote": third person, zoom 12, no shift-lock offset, RootOffset 0.2, pitch
+-- MaxY 50 / MinY -80 degrees, tween 0.25 s.  First-person players go back to first person afterwards.
+function CameraFX:SetEmoting(on)
+	if self.Emoting == on then
+		return
+	end
+	self.Emoting = on
+	if on then
+		self.EmoteForcedThird = not self.ThirdPerson
+		if not self.ThirdPerson then
+			self.ThirdPerson = true
+			self:ApplyCameraType(false)
+		end
+	elseif self.EmoteForcedThird then
+		self.EmoteForcedThird = false
+		self.ThirdPerson = false
+		self:ApplyCameraType(false)
+	end
 end
 
 -- Mouse wheel (MEASURED Camera.TestThirdPerson): two fixed positions.  Each notch adds 1 to
@@ -2677,7 +2780,7 @@ function CameraFX:UpdateThirdPerson(dt)
 	if cam.CameraType ~= Enum.CameraType.Scriptable then
 		cam.CameraType = Enum.CameraType.Scriptable
 	end
-	if not Shared.SettingsOpen then
+	if not menuOpen() then
 		local d = Vector2.zero
 		if not touchOnly() then -- on touch devices mouse delta also carries the joystick drag
 			UserInputService.MouseBehavior = Enum.MouseBehavior.LockCenter
@@ -2702,20 +2805,25 @@ function CameraFX:UpdateThirdPerson(dt)
 			self.Yaw -= g.X * c.GamepadLookSpeed.X * dt
 			self.Pitch += g.Y * c.GamepadLookSpeed.Y * dt
 		end
-		self.Pitch = clamp(self.Pitch, -c.MaxPitch, c.MaxPitch)
+		if self.Emoting then
+			self.Pitch = clamp(self.Pitch, -math.rad(80), math.rad(50))
+		else
+			self.Pitch = clamp(self.Pitch, -c.MaxPitch, c.MaxPitch)
+		end
 	end
-	self.ZoomCurrent = lerp(self.ZoomCurrent, self.Zoom, math.min(dt * c.ZoomRate, 1))
+	local zoomGoal = self.Emoting and 12 or self.Zoom
+	self.ZoomCurrent = lerp(self.ZoomCurrent, zoomGoal, math.min(dt * c.ZoomRate, 1))
 	local ctx = self.Ctx
 	-- Evade's camera subject is its root box (the hull), so the focus is hull centre + 1.5.
 	local focus = ctx.Root.Position + Vector3.new(0, 1.5 + self:HullEyeDelta(), 0)
 	local rot = CFrame.fromOrientation(self.Pitch, self.Yaw, 0)
-	local pivot = CFrame.new(focus) * rot * CFrame.new(c.ThirdPersonShiftLockOffset * math.min(self.ZoomCurrent / c.ThirdPersonZoom, 1))
+	local pivot = CFrame.new(focus) * rot * CFrame.new(self.Emoting and Vector3.zero or c.ThirdPersonShiftLockOffset * math.min(self.ZoomCurrent / c.ThirdPersonZoom, 1))
 	local desired = pivot * CFrame.new(0, 0, self.ZoomCurrent)
 	-- MEASURED Camera/Types ThirdPerson RootOffset 0.4: camera offset by TorsoRot.Transform.p * 0.4
 	local kp = ctx.Animator and ctx.Animator.KeyframePlayer
 	local torsoRot = kp and kp.TorsoRotPose
 	if torsoRot and torsoRot.Position.Magnitude <= 10 then
-		desired *= CFrame.new(torsoRot.Position * c.ThirdPersonRootOffset)
+		desired *= CFrame.new(torsoRot.Position * (self.Emoting and 0.2 or c.ThirdPersonRootOffset))
 	end
 	-- keep the camera out of walls
 	local params = RaycastParams.new()
@@ -2753,7 +2861,7 @@ function CameraFX:UpdateType()
 	-- Both camera types keep the mouse locked (Evade: first person and shift-lock third person).
 	-- Roblox's camera caches the mode it last set and won't reapply it after anything else changes it,
 	-- so the lock is enforced here every frame; the settings panel frees it while open.
-	if not Shared.SettingsOpen and not touchOnly() and UserInputService.MouseBehavior ~= Enum.MouseBehavior.LockCenter then
+	if not menuOpen() and not touchOnly() and UserInputService.MouseBehavior ~= Enum.MouseBehavior.LockCenter then
 		UserInputService.MouseBehavior = Enum.MouseBehavior.LockCenter
 	end
 end
@@ -3516,6 +3624,116 @@ end
 -- KeyframePlayer track mirrors itself onto a "carrier" track using Evade's AnimationClassic id (taken
 -- from the .rbxm file name); other clients running this script read those carriers and play the same
 -- KeyframeSequences on that player's R6 rig locally.
+--------------------------------------------------------------------------------
+-- Emotes (Evade Emote popup + Character emote handler).  Registry "Emote" holds the playing slot (0 =
+-- none), which drives the Emoting states (speed mult, no sprint, face move direction, Emote camera).
+-- The clip is a KeyframePlayer track with a sync carrier, so other script users see it.
+--------------------------------------------------------------------------------
+local Emote = {}
+Emote.__index = Emote
+
+-- MEASURED Emote SetSound: looped Sound on the character's PrimaryPart (Length is unset for these emotes).
+function Emote.MakeSound(entry, character)
+	local part = character and (character.PrimaryPart or character:FindFirstChild("HumanoidRootPart"))
+	if not (part and entry.Sound) then
+		return nil
+	end
+	local s = Instance.new("Sound")
+	s.Name = hiddenName()
+	s.SoundId = "rbxassetid://" .. tostring(entry.Sound)
+	s.Looped = true
+	s.Volume = 0.5 * CONFIG.Emotes.Volume
+	s.RollOffMaxDistance = 80
+	s.Parent = part
+	s:Play()
+	return s
+end
+
+function Emote.new(ctx, maid)
+	local self = setmetatable({ Ctx = ctx, R = ctx.Registry, Maid = maid, Tracks = {}, LastActivated = 0 }, Emote)
+	ctx.Registry:Set("Emote", 0)
+	maid:Give(function()
+		self:Stop(true)
+	end)
+	return self
+end
+
+function Emote:Track(index)
+	local entry = CONFIG.Emotes.List[index]
+	if not entry then
+		return nil
+	end
+	local t = self.Tracks[index]
+	if t == nil then
+		t = self.Ctx.Animator:LoadTrack("Emotes/" .. entry.Name, entry.File, self.Maid) or false
+		if t then
+			t.Priority = Enum.AnimationPriority.Action
+		end
+		self.Tracks[index] = t
+	end
+	return t or nil
+end
+
+function Emote:IsPlaying()
+	return (self.R:Get("Emote") or 0) ~= 0
+end
+
+-- MEASURED KeyActivated/CanActivate: 1.5 s cooldown; picking a slot while emoting does nothing.
+function Emote:Activate(index)
+	if not CONFIG.Emotes.Enabled or self:IsPlaying() or os.clock() - self.LastActivated <= CONFIG.Emotes.Cooldown then
+		return false
+	end
+	if self.Ctx.Humanoid.Health <= 0 then
+		return false
+	end
+	local entry = CONFIG.Emotes.List[index]
+	local track = entry and self:Track(index)
+	if not track then
+		Log.warnOnce("emote:" .. tostring(index), "Emote", ("emote slot %d has no playable clip"):format(index))
+		return false
+	end
+	self.LastActivated = os.clock()
+	self.Index = index
+	self.R:Set("Emote", index)
+	self.Ctx.Movement:SpeedChange("Emote", entry.SpeedMult or 1) -- MEASURED Movement "Emote" registry hook
+	track:Play(DEFAULT_FADE, 1, 1)
+	self.Sound = Emote.MakeSound(entry, self.Ctx.Character)
+	self.Ctx.Camera:SetEmoting(true)
+	return true
+end
+
+function Emote:Stop(instant)
+	local index = self.Index
+	self.Index = nil
+	if self.Sound then
+		pcall(self.Sound.Destroy, self.Sound)
+		self.Sound = nil
+	end
+	local track = index and self.Tracks[index]
+	if track then
+		track:Stop(instant and 0 or DEFAULT_FADE)
+	end
+	if self.R:Get("Emote") ~= 0 then
+		self.R:Set("Emote", 0)
+	end
+	if instant then
+		return -- character teardown: movement and camera are being torn down too
+	end
+	self.Ctx.Movement:SpeedChange("Emote", nil)
+	self.Ctx.Camera:SetEmoting(false)
+end
+
+function Emote:Update()
+	if not self.Index then
+		return
+	end
+	local track = self.Tracks[self.Index]
+	-- a non-looped clip that finished, or death, ends the emote
+	if self.Ctx.Humanoid.Health <= 0 or (track and (not track.IsPlaying or track.WeightTarget <= 0)) then
+		self:Stop()
+	end
+end
+
 local Sync = {}
 
 function Sync.IdFromFile(fileName)
@@ -3537,11 +3755,31 @@ function Sync.Init(appMaid)
 			end
 		end
 	end
+	-- Emotes: same clips at Action priority, plus their sound on the remote character.
+	local emoteById = {}
+	for _, e in CONFIG.Emotes.List do
+		local id = Sync.IdFromFile(e.File)
+		if id then
+			local ok, _, source, ks = pcall(Assets.ResolveAnimation, "Emotes/" .. e.Name, e.File)
+			if ok and ks and source == "KeyframePlayer" then
+				idMap[id] = ks
+				emoteById[id] = e
+			end
+		end
+	end
 	if next(idMap) == nil then
 		Log.info("Sync", "no keyframe animations to sync")
 		return
 	end
-	local remotes = {} -- [player] = { char, maid, kp, tracks = {[id]=KPTrack}, playing = {[id]=bool} }
+	local remotes = {} -- [player] = { char, maid, kp, tracks = {[id]=KPTrack}, playing = {[id]=bool}, sounds = {[id]=Sound} }
+
+	local function stopSound(r, id)
+		local s = r.sounds[id]
+		if s then
+			r.sounds[id] = nil
+			pcall(s.Destroy, s)
+		end
+	end
 
 	local function drop(player)
 		local r = remotes[player]
@@ -3549,6 +3787,9 @@ function Sync.Init(appMaid)
 			remotes[player] = nil
 			for _, t in r.tracks do
 				pcall(t.Destroy, t)
+			end
+			for id in r.sounds do
+				stopSound(r, id)
 			end
 			r.maid:Clean()
 		end
@@ -3583,7 +3824,7 @@ function Sync.Init(appMaid)
 				return
 			end
 			local maid = Maid.new()
-			r = { char = char, maid = maid, kp = KeyframePlayer.new(char, maid), tracks = {}, playing = {} }
+			r = { char = char, maid = maid, kp = KeyframePlayer.new(char, maid), tracks = {}, playing = {}, sounds = {} }
 			remotes[player] = r
 			Log.info("Sync", ("animating %s (EvadeClone user)"):format(player.Name))
 		end
@@ -3591,12 +3832,20 @@ function Sync.Init(appMaid)
 			local t = r.tracks[id]
 			if not t then
 				t = r.kp:NewTrack(idMap[id], "sync" .. id)
+				if emoteById[id] then
+					t.Priority = Enum.AnimationPriority.Action
+				end
 				r.tracks[id] = t
 			end
 			local w, s = at.WeightTarget, at.Speed
 			if not r.playing[id] then
 				r.playing[id] = true
 				t:Play(cfg.RemoteFade, w, s)
+				local e = emoteById[id]
+				if e and e.Sound then
+					stopSound(r, id)
+					r.sounds[id] = Emote.MakeSound(e, char)
+				end
 			else
 				if math.abs(t.WeightTarget - w) > 1e-3 then
 					t:AdjustWeight(w, cfg.RemoteFade)
@@ -3610,6 +3859,7 @@ function Sync.Init(appMaid)
 			if r.playing[id] and not seen[id] then
 				r.playing[id] = false
 				t:Stop(cfg.RemoteFade)
+				stopSound(r, id)
 			end
 		end
 	end
@@ -4306,6 +4556,7 @@ function UI.Init(maid)
 	UI.Speed, UI.HealthValue = nil, nil
 	UI.BuildSettings(maid, parent)
 	UI.BuildMobile(maid, gui)
+	UI.BuildEmoteWheel(maid, gui)
 end
 
 -- Generated from Evade's place file with tools/rbxl/rbxl_reader.luau (export). Do not edit by hand.
@@ -4410,6 +4661,7 @@ local EVADE_UI = {
 		{ Path = "Mobile/Left/Mobile/ChangePovButton", Class = "ImageButton", Props = { AnchorPoint=Vector2.new(0,0.5), AutoButtonColor=false, BackgroundColor3=Color3.new(0,0,0), BackgroundTransparency=0.5, ImageRectOffset=Vector2.new(1,146), ImageRectSize=Vector2.new(144,144), Position=UDim2.new(0,0,0.4,0), Size=UDim2.new(0.15,0,0.15,0) } },
 		{ Path = "Mobile/Left/Mobile/MenuButton", Class = "ImageButton", Props = { AnchorPoint=Vector2.new(0,0.5), AutoButtonColor=false, BackgroundColor3=Color3.new(0,0,0), BackgroundTransparency=0.5, ImageRectOffset=Vector2.new(1,146), ImageRectSize=Vector2.new(144,144), Position=UDim2.new(0,0,0.2,0), Size=UDim2.new(0.15,0,0.15,0) } },
 		{ Path = "Mobile/Right/Mobile/CrouchButton", Class = "ImageButton", Props = { AnchorPoint=Vector2.new(1,0), AutoButtonColor=false, BackgroundColor3=Color3.new(0,0,0), BackgroundTransparency=0.5, ImageRectOffset=Vector2.new(1,146), ImageRectSize=Vector2.new(144,144), Position=UDim2.new(-0.175001,0,0.458333,0), Size=UDim2.new(0.76,0,0.76,0) } },
+		{ Path = "Mobile/Right/Mobile/EmoteButton", Class = "ImageButton", Props = { AnchorPoint=Vector2.new(1,1), AutoButtonColor=false, BackgroundColor3=Color3.new(0,0,0), BackgroundTransparency=0.5, ImageRectOffset=Vector2.new(1,146), ImageRectSize=Vector2.new(144,144), Position=UDim2.new(0.948,0,-1.65,0), Size=UDim2.new(0.6,0,0.6,0) } },
 		{ Path = "Mobile/Left/Mobile/ChangePovButton/Frame", Class = "Frame", Props = { AnchorPoint=Vector2.new(0.5,0.5), BackgroundColor3=Color3.new(1,1,1), BackgroundTransparency=1, Position=UDim2.new(0.5,0,0.5,0), Size=UDim2.new(1,6,1,6) } },
 		{ Path = "Mobile/Left/Mobile/ChangePovButton/ImageLabel", Class = "ImageLabel", Props = { AnchorPoint=Vector2.new(0.5,0.5), BackgroundColor3=Color3.new(1,1,1), BackgroundTransparency=1, Image="rbxassetid://14333878755", ImageTransparency=0.6, Position=UDim2.new(0.51,0,0.4,0), Size=UDim2.new(0.6,0,0.6,0) } },
 		{ Path = "Mobile/Left/Mobile/ChangePovButton/TextLabel", Class = "TextLabel", Props = { AnchorPoint=Vector2.new(0.5,0.5), AutoLocalize=false, BackgroundColor3=Color3.new(1,1,1), BackgroundTransparency=1, FontFace={font="rbxasset://fonts/families/GothamSSm.json",w=700,s=0}, Position=UDim2.new(0.5,0,0.75,0), Size=UDim2.new(0.6,0,0.8,0), Text="POV", TextColor3=Color3.new(1,1,1), TextScaled=true, TextSize=14, TextTransparency=0.4, TextWrapped=true, ZIndex=3 } },
@@ -4424,12 +4676,141 @@ local EVADE_UI = {
 		{ Path = "Mobile/Right/Mobile/CrouchButton/UIAspectRatioConstraint", Class = "UIAspectRatioConstraint", Props = {} },
 		{ Path = "Mobile/Right/Mobile/CrouchButton/UICorner", Class = "UICorner", Props = { BottomLeftRadius=UDim.new(0.5,0), BottomRightRadius=UDim.new(0.5,0), TopLeftRadius=UDim.new(0.5,0), TopRightRadius=UDim.new(0.5,0) } },
 		{ Path = "Mobile/Right/Mobile/CrouchButton/UIStroke", Class = "UIStroke", Props = { Color=Color3.new(1,1,1), Thickness=3, Transparency=0.8 } },
+		{ Path = "Mobile/Right/Mobile/EmoteButton/Frame", Class = "Frame", Props = { AnchorPoint=Vector2.new(0.5,0.5), BackgroundColor3=Color3.new(1,1,1), BackgroundTransparency=1, Position=UDim2.new(0.5,0,0.5,0), Size=UDim2.new(1,6,1,6) } },
+		{ Path = "Mobile/Right/Mobile/EmoteButton/TextLabel", Class = "TextLabel", Props = { BackgroundColor3=Color3.new(1,1,1), BackgroundTransparency=1, FontFace={font="rbxasset://fonts/families/GothamSSm.json",w=700,s=0}, Position=UDim2.new(0,0,0.0400004,0), Size=UDim2.new(1,0,0.799999,0), Text="☻", TextColor3=Color3.new(1,1,1), TextScaled=true, TextSize=14, TextTransparency=0.4, TextWrapped=true, TextYAlignment=0 } },
+		{ Path = "Mobile/Right/Mobile/EmoteButton/UICorner", Class = "UICorner", Props = { BottomLeftRadius=UDim.new(0.5,0), BottomRightRadius=UDim.new(0.5,0), TopLeftRadius=UDim.new(0.5,0), TopRightRadius=UDim.new(0.5,0) } },
+		{ Path = "Mobile/Right/Mobile/EmoteButton/UIStroke", Class = "UIStroke", Props = { Color=Color3.new(1,1,1), Thickness=3, Transparency=0.8 } },
 		{ Path = "Mobile/Left/Mobile/ChangePovButton/Frame/UICorner", Class = "UICorner", Props = { BottomLeftRadius=UDim.new(0.5,0), BottomRightRadius=UDim.new(0.5,0), TopLeftRadius=UDim.new(0.5,0), TopRightRadius=UDim.new(0.5,0) } },
 		{ Path = "Mobile/Left/Mobile/ChangePovButton/Frame/UIStroke", Class = "UIStroke", Props = { Thickness=2, Transparency=0.6 } },
 		{ Path = "Mobile/Left/Mobile/MenuButton/Frame/UICorner", Class = "UICorner", Props = { BottomLeftRadius=UDim.new(0.5,0), BottomRightRadius=UDim.new(0.5,0), TopLeftRadius=UDim.new(0.5,0), TopRightRadius=UDim.new(0.5,0) } },
 		{ Path = "Mobile/Left/Mobile/MenuButton/Frame/UIStroke", Class = "UIStroke", Props = { Thickness=2, Transparency=0.6 } },
 		{ Path = "Mobile/Right/Mobile/CrouchButton/Frame/UICorner", Class = "UICorner", Props = { BottomLeftRadius=UDim.new(0.5,0), BottomRightRadius=UDim.new(0.5,0), TopLeftRadius=UDim.new(0.5,0), TopRightRadius=UDim.new(0.5,0) } },
 		{ Path = "Mobile/Right/Mobile/CrouchButton/Frame/UIStroke", Class = "UIStroke", Props = { Thickness=2, Transparency=0.6 } },
+		{ Path = "Mobile/Right/Mobile/EmoteButton/Frame/UICorner", Class = "UICorner", Props = { BottomLeftRadius=UDim.new(0.5,0), BottomRightRadius=UDim.new(0.5,0), TopLeftRadius=UDim.new(0.5,0), TopRightRadius=UDim.new(0.5,0) } },
+		{ Path = "Mobile/Right/Mobile/EmoteButton/Frame/UIStroke", Class = "UIStroke", Props = { Thickness=2, Transparency=0.6 } },
+	},
+	EmoteWheel = {
+		{ Path = "Emote", Class = "Frame", Props = { AnchorPoint=Vector2.new(0.5,0.5), BackgroundColor3=Color3.new(0.0980392,0.0980392,0.0980392), BackgroundTransparency=1, BorderSizePixel=0, Position=UDim2.new(0.5,0,0.5,0), Size=UDim2.new(1,0,1,0), Visible=false, ZIndex=26 } },
+		{ Path = "Emote/Wheel", Class = "Frame", Props = { AnchorPoint=Vector2.new(0.5,0.5), BackgroundColor3=Color3.new(1,1,1), BackgroundTransparency=1, BorderSizePixel=0, Position=UDim2.new(0.5,0,0.5,0), Size=UDim2.new(0.5,0,0.5,0) } },
+		{ Path = "Emote/Wheel2", Class = "Frame", Props = { AnchorPoint=Vector2.new(0.5,0.5), BackgroundColor3=Color3.new(1,1,1), BackgroundTransparency=1, BorderSizePixel=0, Position=UDim2.new(0.5,0,0.5,0), Size=UDim2.new(0.5,0,0.5,0), Visible=false } },
+		{ Path = "Emote/Wheel/DoubleSlots", Class = "TextLabel", Props = { AnchorPoint=Vector2.new(0.5,0), BackgroundColor3=Color3.new(1,1,1), BackgroundTransparency=1, BorderSizePixel=0, FontFace={font="rbxasset://fonts/families/GothamSSm.json",w=700,s=0}, Position=UDim2.new(0.5,0,1.1,0), Size=UDim2.new(0.4,0,0.1,0), Text="PAGE 1", TextColor3=Color3.new(1,1,1), TextScaled=true, TextSize=14, TextWrapped=true, Visible=false } },
+		{ Path = "Emote/Wheel/Emote1", Class = "Frame", Props = { AnchorPoint=Vector2.new(0.5,0.5), BackgroundColor3=Color3.new(1,1,1), BackgroundTransparency=1, BorderSizePixel=0, Position=UDim2.new(0.1,0,0.5,0), Size=UDim2.new(0.35,0,0.35,0) } },
+		{ Path = "Emote/Wheel/Emote2", Class = "Frame", Props = { AnchorPoint=Vector2.new(0.5,0.5), BackgroundColor3=Color3.new(1,1,1), BackgroundTransparency=1, BorderSizePixel=0, Position=UDim2.new(0.285,0,0.15,0), Size=UDim2.new(0.35,0,0.35,0) } },
+		{ Path = "Emote/Wheel/Emote3", Class = "Frame", Props = { AnchorPoint=Vector2.new(0.5,0.5), BackgroundColor3=Color3.new(1,1,1), BackgroundTransparency=1, BorderSizePixel=0, Position=UDim2.new(0.71,0,0.15,0), Size=UDim2.new(0.35,0,0.35,0) } },
+		{ Path = "Emote/Wheel/Emote4", Class = "Frame", Props = { AnchorPoint=Vector2.new(0.5,0.5), BackgroundColor3=Color3.new(1,1,1), BackgroundTransparency=1, BorderSizePixel=0, Position=UDim2.new(0.9,0,0.5,0), Size=UDim2.new(0.35,0,0.35,0) } },
+		{ Path = "Emote/Wheel/Emote5", Class = "Frame", Props = { AnchorPoint=Vector2.new(0.5,0.5), BackgroundColor3=Color3.new(1,1,1), BackgroundTransparency=1, BorderSizePixel=0, Position=UDim2.new(0.71,0,0.85,0), Size=UDim2.new(0.35,0,0.35,0) } },
+		{ Path = "Emote/Wheel/Emote6", Class = "Frame", Props = { AnchorPoint=Vector2.new(0.5,0.5), BackgroundColor3=Color3.new(1,1,1), BackgroundTransparency=1, BorderSizePixel=0, Position=UDim2.new(0.285,0,0.85,0), Size=UDim2.new(0.35,0,0.35,0) } },
+		{ Path = "Emote/Wheel/Mover", Class = "ImageLabel", Props = { AnchorPoint=Vector2.new(0.5,0.5), BackgroundColor3=Color3.new(1,1,1), BackgroundTransparency=1, BorderSizePixel=0, Image="rbxassetid://14172799547", Position=UDim2.new(0.5,0,0.5,0), Size=UDim2.new(1,0,1,0), Visible=false, ZIndex=0 } },
+		{ Path = "Emote/Wheel/Ring1", Class = "ImageLabel", Props = { AnchorPoint=Vector2.new(0.5,0.5), BackgroundColor3=Color3.new(1,1,1), BackgroundTransparency=1, BorderSizePixel=0, Image="rbxassetid://18644342354", ImageColor3=Color3.new(0.0588235,0.0588235,0.0588235), Position=UDim2.new(0.5,0,0.5,0), Rotation=-60, Size=UDim2.new(1,0,1,0), ZIndex=0 } },
+		{ Path = "Emote/Wheel/Ring2", Class = "ImageLabel", Props = { AnchorPoint=Vector2.new(0.5,0.5), BackgroundColor3=Color3.new(1,1,1), BackgroundTransparency=1, BorderSizePixel=0, Image="rbxassetid://18644342354", ImageColor3=Color3.new(0.0588235,0.0588235,0.0588235), Position=UDim2.new(0.5,0,0.5,0), Size=UDim2.new(1,0,1,0), ZIndex=0 } },
+		{ Path = "Emote/Wheel/Ring3", Class = "ImageLabel", Props = { AnchorPoint=Vector2.new(0.5,0.5), BackgroundColor3=Color3.new(1,1,1), BackgroundTransparency=1, BorderSizePixel=0, Image="rbxassetid://18644342354", ImageColor3=Color3.new(0.0588235,0.0588235,0.0588235), Position=UDim2.new(0.5,0,0.5,0), Rotation=60, Size=UDim2.new(1,0,1,0), ZIndex=0 } },
+		{ Path = "Emote/Wheel/Ring4", Class = "ImageLabel", Props = { AnchorPoint=Vector2.new(0.5,0.5), BackgroundColor3=Color3.new(1,1,1), BackgroundTransparency=1, BorderSizePixel=0, Image="rbxassetid://18644342354", ImageColor3=Color3.new(0.0588235,0.0588235,0.0588235), Position=UDim2.new(0.5,0,0.5,0), Rotation=120, Size=UDim2.new(1,0,1,0), ZIndex=0 } },
+		{ Path = "Emote/Wheel/Ring5", Class = "ImageLabel", Props = { AnchorPoint=Vector2.new(0.5,0.5), BackgroundColor3=Color3.new(1,1,1), BackgroundTransparency=1, BorderSizePixel=0, Image="rbxassetid://18644342354", ImageColor3=Color3.new(0.0588235,0.0588235,0.0588235), Position=UDim2.new(0.5,0,0.5,0), Rotation=180, Size=UDim2.new(1,0,1,0), ZIndex=0 } },
+		{ Path = "Emote/Wheel/Ring6", Class = "ImageLabel", Props = { AnchorPoint=Vector2.new(0.5,0.5), BackgroundColor3=Color3.new(1,1,1), BackgroundTransparency=1, BorderSizePixel=0, Image="rbxassetid://18644342354", ImageColor3=Color3.new(0.0588235,0.0588235,0.0588235), Position=UDim2.new(0.5,0,0.5,0), Rotation=240, Size=UDim2.new(1,0,1,0), ZIndex=0 } },
+		{ Path = "Emote/Wheel2/DoubleSlots", Class = "TextLabel", Props = { AnchorPoint=Vector2.new(0.5,0), BackgroundColor3=Color3.new(1,1,1), BackgroundTransparency=1, BorderSizePixel=0, FontFace={font="rbxasset://fonts/families/GothamSSm.json",w=700,s=0}, Position=UDim2.new(0.5,0,1.1,0), Size=UDim2.new(0.4,0,0.1,0), Text="PAGE 2", TextColor3=Color3.new(1,1,1), TextScaled=true, TextSize=14, TextWrapped=true } },
+		{ Path = "Emote/Wheel2/Emote1", Class = "Frame", Props = { AnchorPoint=Vector2.new(0.5,0.5), BackgroundColor3=Color3.new(1,1,1), BackgroundTransparency=1, BorderSizePixel=0, Position=UDim2.new(0.1,0,0.5,0), Size=UDim2.new(0.35,0,0.35,0) } },
+		{ Path = "Emote/Wheel2/Emote2", Class = "Frame", Props = { AnchorPoint=Vector2.new(0.5,0.5), BackgroundColor3=Color3.new(1,1,1), BackgroundTransparency=1, BorderSizePixel=0, Position=UDim2.new(0.285,0,0.15,0), Size=UDim2.new(0.35,0,0.35,0) } },
+		{ Path = "Emote/Wheel2/Emote3", Class = "Frame", Props = { AnchorPoint=Vector2.new(0.5,0.5), BackgroundColor3=Color3.new(1,1,1), BackgroundTransparency=1, BorderSizePixel=0, Position=UDim2.new(0.71,0,0.15,0), Size=UDim2.new(0.35,0,0.35,0) } },
+		{ Path = "Emote/Wheel2/Emote4", Class = "Frame", Props = { AnchorPoint=Vector2.new(0.5,0.5), BackgroundColor3=Color3.new(1,1,1), BackgroundTransparency=1, BorderSizePixel=0, Position=UDim2.new(0.9,0,0.5,0), Size=UDim2.new(0.35,0,0.35,0) } },
+		{ Path = "Emote/Wheel2/Emote5", Class = "Frame", Props = { AnchorPoint=Vector2.new(0.5,0.5), BackgroundColor3=Color3.new(1,1,1), BackgroundTransparency=1, BorderSizePixel=0, Position=UDim2.new(0.71,0,0.85,0), Size=UDim2.new(0.35,0,0.35,0) } },
+		{ Path = "Emote/Wheel2/Emote6", Class = "Frame", Props = { AnchorPoint=Vector2.new(0.5,0.5), BackgroundColor3=Color3.new(1,1,1), BackgroundTransparency=1, BorderSizePixel=0, Position=UDim2.new(0.285,0,0.85,0), Size=UDim2.new(0.35,0,0.35,0) } },
+		{ Path = "Emote/Wheel2/Mover", Class = "ImageLabel", Props = { AnchorPoint=Vector2.new(0.5,0.5), BackgroundColor3=Color3.new(1,1,1), BackgroundTransparency=1, BorderSizePixel=0, Image="rbxassetid://14172799547", Position=UDim2.new(0.5,0,0.5,0), Size=UDim2.new(1,0,1,0), Visible=false, ZIndex=0 } },
+		{ Path = "Emote/Wheel2/Ring1", Class = "ImageLabel", Props = { AnchorPoint=Vector2.new(0.5,0.5), BackgroundColor3=Color3.new(1,1,1), BackgroundTransparency=1, BorderSizePixel=0, Image="rbxassetid://18644342354", ImageColor3=Color3.new(0.0588235,0.0588235,0.0588235), Position=UDim2.new(0.5,0,0.5,0), Rotation=-60, Size=UDim2.new(1,0,1,0), ZIndex=0 } },
+		{ Path = "Emote/Wheel2/Ring2", Class = "ImageLabel", Props = { AnchorPoint=Vector2.new(0.5,0.5), BackgroundColor3=Color3.new(1,1,1), BackgroundTransparency=1, BorderSizePixel=0, Image="rbxassetid://18644342354", ImageColor3=Color3.new(0.0588235,0.0588235,0.0588235), Position=UDim2.new(0.5,0,0.5,0), Size=UDim2.new(1,0,1,0), ZIndex=0 } },
+		{ Path = "Emote/Wheel2/Ring3", Class = "ImageLabel", Props = { AnchorPoint=Vector2.new(0.5,0.5), BackgroundColor3=Color3.new(1,1,1), BackgroundTransparency=1, BorderSizePixel=0, Image="rbxassetid://18644342354", ImageColor3=Color3.new(0.0588235,0.0588235,0.0588235), Position=UDim2.new(0.5,0,0.5,0), Rotation=60, Size=UDim2.new(1,0,1,0), ZIndex=0 } },
+		{ Path = "Emote/Wheel2/Ring4", Class = "ImageLabel", Props = { AnchorPoint=Vector2.new(0.5,0.5), BackgroundColor3=Color3.new(1,1,1), BackgroundTransparency=1, BorderSizePixel=0, Image="rbxassetid://18644342354", ImageColor3=Color3.new(0.0588235,0.0588235,0.0588235), Position=UDim2.new(0.5,0,0.5,0), Rotation=120, Size=UDim2.new(1,0,1,0), ZIndex=0 } },
+		{ Path = "Emote/Wheel2/Ring5", Class = "ImageLabel", Props = { AnchorPoint=Vector2.new(0.5,0.5), BackgroundColor3=Color3.new(1,1,1), BackgroundTransparency=1, BorderSizePixel=0, Image="rbxassetid://18644342354", ImageColor3=Color3.new(0.0588235,0.0588235,0.0588235), Position=UDim2.new(0.5,0,0.5,0), Rotation=180, Size=UDim2.new(1,0,1,0), ZIndex=0 } },
+		{ Path = "Emote/Wheel2/Ring6", Class = "ImageLabel", Props = { AnchorPoint=Vector2.new(0.5,0.5), BackgroundColor3=Color3.new(1,1,1), BackgroundTransparency=1, BorderSizePixel=0, Image="rbxassetid://18644342354", ImageColor3=Color3.new(0.0588235,0.0588235,0.0588235), Position=UDim2.new(0.5,0,0.5,0), Rotation=240, Size=UDim2.new(1,0,1,0), ZIndex=0 } },
+		{ Path = "Emote/Wheel/DoubleSlots/TextButton", Class = "TextButton", Props = { AnchorPoint=Vector2.new(0.5,0), BackgroundColor3=Color3.new(0.494118,0.494118,0.494118), BorderSizePixel=0, FontFace={font="rbxasset://fonts/families/GothamSSm.json",w=700,s=0}, Position=UDim2.new(0.5,0,1.2,0), Size=UDim2.new(1.5,0,1.5,0), Text=">", TextColor3=Color3.new(1,1,1), TextScaled=true, TextSize=14, TextWrapped=true } },
+		{ Path = "Emote/Wheel/DoubleSlots/UIStroke", Class = "UIStroke", Props = { Thickness=2, Transparency=0.5 } },
+		{ Path = "Emote/Wheel/Emote1/Button", Class = "TextButton", Props = { BackgroundColor3=Color3.new(0.0588235,0.0588235,0.0588235), BackgroundTransparency=1, BorderSizePixel=0, FontFace={font="rbxasset://fonts/families/SourceSansPro.json",w=400,s=0}, Size=UDim2.new(1,0,1,0), Text="", TextColor3=Color3.new(0,0,0), TextSize=14, ZIndex=0 } },
+		{ Path = "Emote/Wheel/Emote1/Number", Class = "TextLabel", Props = { BackgroundColor3=Color3.new(1,1,1), BackgroundTransparency=1, BorderSizePixel=0, FontFace={font="rbxasset://fonts/families/GothamSSm.json",w=700,s=0}, Position=UDim2.new(0.181647,0,0.391763,0), Size=UDim2.new(1,0,0.2,0), Text="1", TextColor3=Color3.new(1,1,1), TextScaled=true, TextSize=14, TextWrapped=true, TextXAlignment=0, ZIndex=3 } },
+		{ Path = "Emote/Wheel/Emote1/TextLabel", Class = "TextLabel", Props = { AnchorPoint=Vector2.new(0,1), BackgroundColor3=Color3.new(1,1,1), BackgroundTransparency=1, BorderSizePixel=0, FontFace={font="rbxasset://fonts/families/GothamSSm.json",w=700,s=0}, Position=UDim2.new(0,0,1,0), Size=UDim2.new(1,0,0.2,0), Text="Emote", TextColor3=Color3.new(1,1,1), TextScaled=true, TextSize=14, TextWrapped=true, ZIndex=3 } },
+		{ Path = "Emote/Wheel/Emote2/Button", Class = "TextButton", Props = { BackgroundColor3=Color3.new(0.0588235,0.0588235,0.0588235), BackgroundTransparency=1, BorderSizePixel=0, FontFace={font="rbxasset://fonts/families/SourceSansPro.json",w=400,s=0}, Size=UDim2.new(1,0,1,0), Text="", TextColor3=Color3.new(0,0,0), TextSize=14, ZIndex=0 } },
+		{ Path = "Emote/Wheel/Emote2/Number", Class = "TextLabel", Props = { BackgroundColor3=Color3.new(1,1,1), BackgroundTransparency=1, BorderSizePixel=0, FontFace={font="rbxasset://fonts/families/GothamSSm.json",w=700,s=0}, Position=UDim2.new(-0.531104,0,0.137694,0), Size=UDim2.new(1,0,0.2,0), Text="2", TextColor3=Color3.new(1,1,1), TextScaled=true, TextSize=14, TextWrapped=true, TextXAlignment=1, ZIndex=3 } },
+		{ Path = "Emote/Wheel/Emote2/TextLabel", Class = "TextLabel", Props = { AnchorPoint=Vector2.new(0,1), BackgroundColor3=Color3.new(1,1,1), BackgroundTransparency=1, BorderSizePixel=0, FontFace={font="rbxasset://fonts/families/GothamSSm.json",w=700,s=0}, Position=UDim2.new(0,0,1,0), Size=UDim2.new(1,0,0.2,0), Text="Emote", TextColor3=Color3.new(1,1,1), TextScaled=true, TextSize=14, TextWrapped=true, ZIndex=3 } },
+		{ Path = "Emote/Wheel/Emote3/Button", Class = "TextButton", Props = { BackgroundColor3=Color3.new(0.0588235,0.0588235,0.0588235), BackgroundTransparency=1, BorderSizePixel=0, FontFace={font="rbxasset://fonts/families/SourceSansPro.json",w=400,s=0}, Size=UDim2.new(1,0,1,0), Text="", TextColor3=Color3.new(0,0,0), TextSize=14, ZIndex=0 } },
+		{ Path = "Emote/Wheel/Emote3/Number", Class = "TextLabel", Props = { BackgroundColor3=Color3.new(1,1,1), BackgroundTransparency=1, BorderSizePixel=0, FontFace={font="rbxasset://fonts/families/GothamSSm.json",w=700,s=0}, Position=UDim2.new(0.540939,0,0.137694,0), Size=UDim2.new(1,0,0.2,0), Text="3", TextColor3=Color3.new(1,1,1), TextScaled=true, TextSize=14, TextWrapped=true, TextXAlignment=0, ZIndex=3 } },
+		{ Path = "Emote/Wheel/Emote3/TextLabel", Class = "TextLabel", Props = { AnchorPoint=Vector2.new(0,1), BackgroundColor3=Color3.new(1,1,1), BackgroundTransparency=1, BorderSizePixel=0, FontFace={font="rbxasset://fonts/families/GothamSSm.json",w=700,s=0}, Position=UDim2.new(0,0,1,0), Size=UDim2.new(1,0,0.2,0), Text="Emote", TextColor3=Color3.new(1,1,1), TextScaled=true, TextSize=14, TextWrapped=true, ZIndex=3 } },
+		{ Path = "Emote/Wheel/Emote4/Button", Class = "TextButton", Props = { BackgroundColor3=Color3.new(0.0588235,0.0588235,0.0588235), BackgroundTransparency=1, BorderSizePixel=0, FontFace={font="rbxasset://fonts/families/SourceSansPro.json",w=400,s=0}, Size=UDim2.new(1,0,1,0), Text="", TextColor3=Color3.new(0,0,0), TextSize=14, ZIndex=0 } },
+		{ Path = "Emote/Wheel/Emote4/Number", Class = "TextLabel", Props = { BackgroundColor3=Color3.new(1,1,1), BackgroundTransparency=1, BorderSizePixel=0, FontFace={font="rbxasset://fonts/families/GothamSSm.json",w=700,s=0}, Position=UDim2.new(-0.13,0,0.392,0), Size=UDim2.new(1,0,0.2,0), Text="4", TextColor3=Color3.new(1,1,1), TextScaled=true, TextSize=14, TextWrapped=true, TextXAlignment=1, ZIndex=3 } },
+		{ Path = "Emote/Wheel/Emote4/TextLabel", Class = "TextLabel", Props = { AnchorPoint=Vector2.new(0,1), BackgroundColor3=Color3.new(1,1,1), BackgroundTransparency=1, BorderSizePixel=0, FontFace={font="rbxasset://fonts/families/GothamSSm.json",w=700,s=0}, Position=UDim2.new(0,0,1,0), Size=UDim2.new(1,0,0.2,0), Text="Emote", TextColor3=Color3.new(1,1,1), TextScaled=true, TextSize=14, TextWrapped=true, ZIndex=3 } },
+		{ Path = "Emote/Wheel/Emote5/Button", Class = "TextButton", Props = { BackgroundColor3=Color3.new(0.0588235,0.0588235,0.0588235), BackgroundTransparency=1, BorderSizePixel=0, FontFace={font="rbxasset://fonts/families/SourceSansPro.json",w=400,s=0}, Size=UDim2.new(1,0,1,0), Text="", TextColor3=Color3.new(0,0,0), TextSize=14, ZIndex=0 } },
+		{ Path = "Emote/Wheel/Emote5/Number", Class = "TextLabel", Props = { BackgroundColor3=Color3.new(1,1,1), BackgroundTransparency=1, BorderSizePixel=0, FontFace={font="rbxasset://fonts/families/GothamSSm.json",w=700,s=0}, Position=UDim2.new(-0.264728,0,0.595058,0), Size=UDim2.new(1,0,0.2,0), Text="5", TextColor3=Color3.new(1,1,1), TextScaled=true, TextSize=14, TextWrapped=true, TextXAlignment=1, ZIndex=3 } },
+		{ Path = "Emote/Wheel/Emote5/TextLabel", Class = "TextLabel", Props = { AnchorPoint=Vector2.new(0,1), BackgroundColor3=Color3.new(1,1,1), BackgroundTransparency=1, BorderSizePixel=0, FontFace={font="rbxasset://fonts/families/GothamSSm.json",w=700,s=0}, Position=UDim2.new(0,0,1,0), Size=UDim2.new(1,0,0.2,0), Text="Emote", TextColor3=Color3.new(1,1,1), TextScaled=true, TextSize=14, TextWrapped=true, ZIndex=3 } },
+		{ Path = "Emote/Wheel/Emote6/Button", Class = "TextButton", Props = { BackgroundColor3=Color3.new(0.0588235,0.0588235,0.0588235), BackgroundTransparency=1, BorderSizePixel=0, FontFace={font="rbxasset://fonts/families/SourceSansPro.json",w=400,s=0}, Size=UDim2.new(1,0,1,0), Text="", TextColor3=Color3.new(0,0,0), TextSize=14, ZIndex=0 } },
+		{ Path = "Emote/Wheel/Emote6/Number", Class = "TextLabel", Props = { BackgroundColor3=Color3.new(1,1,1), BackgroundTransparency=1, BorderSizePixel=0, FontFace={font="rbxasset://fonts/families/GothamSSm.json",w=700,s=0}, Position=UDim2.new(0.284399,0,0.595058,0), Size=UDim2.new(1,0,0.2,0), Text="6", TextColor3=Color3.new(1,1,1), TextScaled=true, TextSize=14, TextWrapped=true, TextXAlignment=0, ZIndex=3 } },
+		{ Path = "Emote/Wheel/Emote6/TextLabel", Class = "TextLabel", Props = { AnchorPoint=Vector2.new(0,1), BackgroundColor3=Color3.new(1,1,1), BackgroundTransparency=1, BorderSizePixel=0, FontFace={font="rbxasset://fonts/families/GothamSSm.json",w=700,s=0}, Position=UDim2.new(0,0,1,0), Size=UDim2.new(1,0,0.2,0), Text="Emote", TextColor3=Color3.new(1,1,1), TextScaled=true, TextSize=14, TextWrapped=true, ZIndex=3 } },
+		{ Path = "Emote/Wheel2/DoubleSlots/TextButton", Class = "TextButton", Props = { AnchorPoint=Vector2.new(0.5,0), BackgroundColor3=Color3.new(0.494118,0.494118,0.494118), BorderSizePixel=0, FontFace={font="rbxasset://fonts/families/GothamSSm.json",w=700,s=0}, Position=UDim2.new(0.5,0,1.2,0), Size=UDim2.new(1.5,0,1.5,0), Text="<", TextColor3=Color3.new(1,1,1), TextScaled=true, TextSize=14, TextWrapped=true } },
+		{ Path = "Emote/Wheel2/DoubleSlots/UIStroke", Class = "UIStroke", Props = { Thickness=2, Transparency=0.5 } },
+		{ Path = "Emote/Wheel2/Emote1/Button", Class = "TextButton", Props = { BackgroundColor3=Color3.new(0.0588235,0.0588235,0.0588235), BackgroundTransparency=1, BorderSizePixel=0, FontFace={font="rbxasset://fonts/families/SourceSansPro.json",w=400,s=0}, Size=UDim2.new(1,0,1,0), Text="", TextColor3=Color3.new(0,0,0), TextSize=14, ZIndex=0 } },
+		{ Path = "Emote/Wheel2/Emote1/Number", Class = "TextLabel", Props = { BackgroundColor3=Color3.new(1,1,1), BackgroundTransparency=1, BorderSizePixel=0, FontFace={font="rbxasset://fonts/families/GothamSSm.json",w=700,s=0}, Position=UDim2.new(0.181647,0,0.391763,0), Size=UDim2.new(1,0,0.2,0), Text="1", TextColor3=Color3.new(1,1,1), TextScaled=true, TextSize=14, TextWrapped=true, TextXAlignment=0, ZIndex=3 } },
+		{ Path = "Emote/Wheel2/Emote1/TextLabel", Class = "TextLabel", Props = { AnchorPoint=Vector2.new(0,1), BackgroundColor3=Color3.new(1,1,1), BackgroundTransparency=1, BorderSizePixel=0, FontFace={font="rbxasset://fonts/families/GothamSSm.json",w=700,s=0}, Position=UDim2.new(0,0,1,0), Size=UDim2.new(1,0,0.2,0), Text="Emote", TextColor3=Color3.new(1,1,1), TextScaled=true, TextSize=14, TextWrapped=true, ZIndex=3 } },
+		{ Path = "Emote/Wheel2/Emote2/Button", Class = "TextButton", Props = { BackgroundColor3=Color3.new(0.0588235,0.0588235,0.0588235), BackgroundTransparency=1, BorderSizePixel=0, FontFace={font="rbxasset://fonts/families/SourceSansPro.json",w=400,s=0}, Size=UDim2.new(1,0,1,0), Text="", TextColor3=Color3.new(0,0,0), TextSize=14, ZIndex=0 } },
+		{ Path = "Emote/Wheel2/Emote2/Number", Class = "TextLabel", Props = { BackgroundColor3=Color3.new(1,1,1), BackgroundTransparency=1, BorderSizePixel=0, FontFace={font="rbxasset://fonts/families/GothamSSm.json",w=700,s=0}, Position=UDim2.new(-0.531104,0,0.137694,0), Size=UDim2.new(1,0,0.2,0), Text="2", TextColor3=Color3.new(1,1,1), TextScaled=true, TextSize=14, TextWrapped=true, TextXAlignment=1, ZIndex=3 } },
+		{ Path = "Emote/Wheel2/Emote2/TextLabel", Class = "TextLabel", Props = { AnchorPoint=Vector2.new(0,1), BackgroundColor3=Color3.new(1,1,1), BackgroundTransparency=1, BorderSizePixel=0, FontFace={font="rbxasset://fonts/families/GothamSSm.json",w=700,s=0}, Position=UDim2.new(0,0,1,0), Size=UDim2.new(1,0,0.2,0), Text="Emote", TextColor3=Color3.new(1,1,1), TextScaled=true, TextSize=14, TextWrapped=true, ZIndex=3 } },
+		{ Path = "Emote/Wheel2/Emote3/Button", Class = "TextButton", Props = { BackgroundColor3=Color3.new(0.0588235,0.0588235,0.0588235), BackgroundTransparency=1, BorderSizePixel=0, FontFace={font="rbxasset://fonts/families/SourceSansPro.json",w=400,s=0}, Size=UDim2.new(1,0,1,0), Text="", TextColor3=Color3.new(0,0,0), TextSize=14, ZIndex=0 } },
+		{ Path = "Emote/Wheel2/Emote3/Number", Class = "TextLabel", Props = { BackgroundColor3=Color3.new(1,1,1), BackgroundTransparency=1, BorderSizePixel=0, FontFace={font="rbxasset://fonts/families/GothamSSm.json",w=700,s=0}, Position=UDim2.new(0.540939,0,0.137694,0), Size=UDim2.new(1,0,0.2,0), Text="3", TextColor3=Color3.new(1,1,1), TextScaled=true, TextSize=14, TextWrapped=true, TextXAlignment=0, ZIndex=3 } },
+		{ Path = "Emote/Wheel2/Emote3/TextLabel", Class = "TextLabel", Props = { AnchorPoint=Vector2.new(0,1), BackgroundColor3=Color3.new(1,1,1), BackgroundTransparency=1, BorderSizePixel=0, FontFace={font="rbxasset://fonts/families/GothamSSm.json",w=700,s=0}, Position=UDim2.new(0,0,1,0), Size=UDim2.new(1,0,0.2,0), Text="Emote", TextColor3=Color3.new(1,1,1), TextScaled=true, TextSize=14, TextWrapped=true, ZIndex=3 } },
+		{ Path = "Emote/Wheel2/Emote4/Button", Class = "TextButton", Props = { BackgroundColor3=Color3.new(0.0588235,0.0588235,0.0588235), BackgroundTransparency=1, BorderSizePixel=0, FontFace={font="rbxasset://fonts/families/SourceSansPro.json",w=400,s=0}, Size=UDim2.new(1,0,1,0), Text="", TextColor3=Color3.new(0,0,0), TextSize=14, ZIndex=0 } },
+		{ Path = "Emote/Wheel2/Emote4/Number", Class = "TextLabel", Props = { BackgroundColor3=Color3.new(1,1,1), BackgroundTransparency=1, BorderSizePixel=0, FontFace={font="rbxasset://fonts/families/GothamSSm.json",w=700,s=0}, Position=UDim2.new(-0.13,0,0.392,0), Size=UDim2.new(1,0,0.2,0), Text="4", TextColor3=Color3.new(1,1,1), TextScaled=true, TextSize=14, TextWrapped=true, TextXAlignment=1, ZIndex=3 } },
+		{ Path = "Emote/Wheel2/Emote4/TextLabel", Class = "TextLabel", Props = { AnchorPoint=Vector2.new(0,1), BackgroundColor3=Color3.new(1,1,1), BackgroundTransparency=1, BorderSizePixel=0, FontFace={font="rbxasset://fonts/families/GothamSSm.json",w=700,s=0}, Position=UDim2.new(0,0,1,0), Size=UDim2.new(1,0,0.2,0), Text="Emote", TextColor3=Color3.new(1,1,1), TextScaled=true, TextSize=14, TextWrapped=true, ZIndex=3 } },
+		{ Path = "Emote/Wheel2/Emote5/Button", Class = "TextButton", Props = { BackgroundColor3=Color3.new(0.0588235,0.0588235,0.0588235), BackgroundTransparency=1, BorderSizePixel=0, FontFace={font="rbxasset://fonts/families/SourceSansPro.json",w=400,s=0}, Size=UDim2.new(1,0,1,0), Text="", TextColor3=Color3.new(0,0,0), TextSize=14, ZIndex=0 } },
+		{ Path = "Emote/Wheel2/Emote5/Number", Class = "TextLabel", Props = { BackgroundColor3=Color3.new(1,1,1), BackgroundTransparency=1, BorderSizePixel=0, FontFace={font="rbxasset://fonts/families/GothamSSm.json",w=700,s=0}, Position=UDim2.new(-0.264728,0,0.595058,0), Size=UDim2.new(1,0,0.2,0), Text="5", TextColor3=Color3.new(1,1,1), TextScaled=true, TextSize=14, TextWrapped=true, TextXAlignment=1, ZIndex=3 } },
+		{ Path = "Emote/Wheel2/Emote5/TextLabel", Class = "TextLabel", Props = { AnchorPoint=Vector2.new(0,1), BackgroundColor3=Color3.new(1,1,1), BackgroundTransparency=1, BorderSizePixel=0, FontFace={font="rbxasset://fonts/families/GothamSSm.json",w=700,s=0}, Position=UDim2.new(0,0,1,0), Size=UDim2.new(1,0,0.2,0), Text="Emote", TextColor3=Color3.new(1,1,1), TextScaled=true, TextSize=14, TextWrapped=true, ZIndex=3 } },
+		{ Path = "Emote/Wheel2/Emote6/Button", Class = "TextButton", Props = { BackgroundColor3=Color3.new(0.0588235,0.0588235,0.0588235), BackgroundTransparency=1, BorderSizePixel=0, FontFace={font="rbxasset://fonts/families/SourceSansPro.json",w=400,s=0}, Size=UDim2.new(1,0,1,0), Text="", TextColor3=Color3.new(0,0,0), TextSize=14, ZIndex=0 } },
+		{ Path = "Emote/Wheel2/Emote6/Number", Class = "TextLabel", Props = { BackgroundColor3=Color3.new(1,1,1), BackgroundTransparency=1, BorderSizePixel=0, FontFace={font="rbxasset://fonts/families/GothamSSm.json",w=700,s=0}, Position=UDim2.new(0.284399,0,0.595058,0), Size=UDim2.new(1,0,0.2,0), Text="6", TextColor3=Color3.new(1,1,1), TextScaled=true, TextSize=14, TextWrapped=true, TextXAlignment=0, ZIndex=3 } },
+		{ Path = "Emote/Wheel2/Emote6/TextLabel", Class = "TextLabel", Props = { AnchorPoint=Vector2.new(0,1), BackgroundColor3=Color3.new(1,1,1), BackgroundTransparency=1, BorderSizePixel=0, FontFace={font="rbxasset://fonts/families/GothamSSm.json",w=700,s=0}, Position=UDim2.new(0,0,1,0), Size=UDim2.new(1,0,0.2,0), Text="Emote", TextColor3=Color3.new(1,1,1), TextScaled=true, TextSize=14, TextWrapped=true, ZIndex=3 } },
+		{ Path = "Emote/Wheel/DoubleSlots/TextButton/TextLabel", Class = "TextLabel", Props = { AnchorPoint=Vector2.new(0.5,0), BackgroundColor3=Color3.new(1,1,1), BackgroundTransparency=1, BorderSizePixel=0, FontFace={font="rbxasset://fonts/families/GothamSSm.json",w=700,s=0}, Position=UDim2.new(0.5,0,1.1,0), Size=UDim2.new(1,0,0.5,0), Text="[Q]", TextColor3=Color3.new(1,1,1), TextScaled=true, TextSize=14, TextWrapped=true } },
+		{ Path = "Emote/Wheel/DoubleSlots/TextButton/UIAspectRatioConstraint", Class = "UIAspectRatioConstraint", Props = {} },
+		{ Path = "Emote/Wheel/DoubleSlots/TextButton/UICorner", Class = "UICorner", Props = { BottomLeftRadius=UDim.new(0,6), BottomRightRadius=UDim.new(0,6), TopLeftRadius=UDim.new(0,6), TopRightRadius=UDim.new(0,6) } },
+		{ Path = "Emote/Wheel/DoubleSlots/TextButton/UIGradient", Class = "UIGradient", Props = { Color=ColorSequence.new({ColorSequenceKeypoint.new(0,Color3.new(1,1,1)),ColorSequenceKeypoint.new(0.67128,Color3.new(0.92549,0.92549,0.92549)),ColorSequenceKeypoint.new(1,Color3.new(0.713726,0.713726,0.713726))}), Rotation=90, Transparency=NumberSequence.new({NumberSequenceKeypoint.new(0.00,0.00),NumberSequenceKeypoint.new(1.00,0.00)}) } },
+		{ Path = "Emote/Wheel/DoubleSlots/TextButton/UIStroke", Class = "UIStroke", Props = { ApplyStrokeMode=1, Thickness=2, Transparency=0.5 } },
+		{ Path = "Emote/Wheel/DoubleSlots/TextButton/UIStroke", Class = "UIStroke", Props = { Thickness=3, Transparency=0.5 } },
+		{ Path = "Emote/Wheel/Emote1/Button/UICorner", Class = "UICorner", Props = { BottomLeftRadius=UDim.new(0.5,0), BottomRightRadius=UDim.new(0.5,0), TopLeftRadius=UDim.new(0.5,0), TopRightRadius=UDim.new(0.5,0) } },
+		{ Path = "Emote/Wheel/Emote1/Number/UIStroke", Class = "UIStroke", Props = { Thickness=2, Transparency=0.5 } },
+		{ Path = "Emote/Wheel/Emote1/TextLabel/UIStroke", Class = "UIStroke", Props = { Thickness=2, Transparency=0.5 } },
+		{ Path = "Emote/Wheel/Emote2/Button/UICorner", Class = "UICorner", Props = { BottomLeftRadius=UDim.new(0.5,0), BottomRightRadius=UDim.new(0.5,0), TopLeftRadius=UDim.new(0.5,0), TopRightRadius=UDim.new(0.5,0) } },
+		{ Path = "Emote/Wheel/Emote2/Number/UIStroke", Class = "UIStroke", Props = { Thickness=2, Transparency=0.5 } },
+		{ Path = "Emote/Wheel/Emote2/TextLabel/UIStroke", Class = "UIStroke", Props = { Thickness=2, Transparency=0.5 } },
+		{ Path = "Emote/Wheel/Emote3/Button/UICorner", Class = "UICorner", Props = { BottomLeftRadius=UDim.new(0.5,0), BottomRightRadius=UDim.new(0.5,0), TopLeftRadius=UDim.new(0.5,0), TopRightRadius=UDim.new(0.5,0) } },
+		{ Path = "Emote/Wheel/Emote3/Number/UIStroke", Class = "UIStroke", Props = { Thickness=2, Transparency=0.5 } },
+		{ Path = "Emote/Wheel/Emote3/TextLabel/UIStroke", Class = "UIStroke", Props = { Thickness=2, Transparency=0.5 } },
+		{ Path = "Emote/Wheel/Emote4/Button/UICorner", Class = "UICorner", Props = { BottomLeftRadius=UDim.new(0.5,0), BottomRightRadius=UDim.new(0.5,0), TopLeftRadius=UDim.new(0.5,0), TopRightRadius=UDim.new(0.5,0) } },
+		{ Path = "Emote/Wheel/Emote4/Number/UIStroke", Class = "UIStroke", Props = { Thickness=2, Transparency=0.5 } },
+		{ Path = "Emote/Wheel/Emote4/TextLabel/UIStroke", Class = "UIStroke", Props = { Thickness=2, Transparency=0.5 } },
+		{ Path = "Emote/Wheel/Emote5/Button/UICorner", Class = "UICorner", Props = { BottomLeftRadius=UDim.new(0.5,0), BottomRightRadius=UDim.new(0.5,0), TopLeftRadius=UDim.new(0.5,0), TopRightRadius=UDim.new(0.5,0) } },
+		{ Path = "Emote/Wheel/Emote5/Number/UIStroke", Class = "UIStroke", Props = { Thickness=2, Transparency=0.5 } },
+		{ Path = "Emote/Wheel/Emote5/TextLabel/UIStroke", Class = "UIStroke", Props = { Thickness=2, Transparency=0.5 } },
+		{ Path = "Emote/Wheel/Emote6/Button/UICorner", Class = "UICorner", Props = { BottomLeftRadius=UDim.new(0.5,0), BottomRightRadius=UDim.new(0.5,0), TopLeftRadius=UDim.new(0.5,0), TopRightRadius=UDim.new(0.5,0) } },
+		{ Path = "Emote/Wheel/Emote6/Number/UIStroke", Class = "UIStroke", Props = { Thickness=2, Transparency=0.5 } },
+		{ Path = "Emote/Wheel/Emote6/TextLabel/UIStroke", Class = "UIStroke", Props = { Thickness=2, Transparency=0.5 } },
+		{ Path = "Emote/Wheel2/DoubleSlots/TextButton/TextLabel", Class = "TextLabel", Props = { AnchorPoint=Vector2.new(0.5,0), BackgroundColor3=Color3.new(1,1,1), BackgroundTransparency=1, BorderSizePixel=0, FontFace={font="rbxasset://fonts/families/GothamSSm.json",w=700,s=0}, Position=UDim2.new(0.5,0,1.1,0), Size=UDim2.new(1,0,0.5,0), Text="[Q]", TextColor3=Color3.new(1,1,1), TextScaled=true, TextSize=14, TextWrapped=true } },
+		{ Path = "Emote/Wheel2/DoubleSlots/TextButton/UIAspectRatioConstraint", Class = "UIAspectRatioConstraint", Props = {} },
+		{ Path = "Emote/Wheel2/DoubleSlots/TextButton/UICorner", Class = "UICorner", Props = { BottomLeftRadius=UDim.new(0,6), BottomRightRadius=UDim.new(0,6), TopLeftRadius=UDim.new(0,6), TopRightRadius=UDim.new(0,6) } },
+		{ Path = "Emote/Wheel2/DoubleSlots/TextButton/UIGradient", Class = "UIGradient", Props = { Color=ColorSequence.new({ColorSequenceKeypoint.new(0,Color3.new(1,1,1)),ColorSequenceKeypoint.new(0.67128,Color3.new(0.92549,0.92549,0.92549)),ColorSequenceKeypoint.new(1,Color3.new(0.713726,0.713726,0.713726))}), Rotation=90, Transparency=NumberSequence.new({NumberSequenceKeypoint.new(0.00,0.00),NumberSequenceKeypoint.new(1.00,0.00)}) } },
+		{ Path = "Emote/Wheel2/DoubleSlots/TextButton/UIStroke", Class = "UIStroke", Props = { Thickness=3, Transparency=0.5 } },
+		{ Path = "Emote/Wheel2/DoubleSlots/TextButton/UIStroke", Class = "UIStroke", Props = { ApplyStrokeMode=1, Transparency=0.5 } },
+		{ Path = "Emote/Wheel2/Emote1/Button/UICorner", Class = "UICorner", Props = { BottomLeftRadius=UDim.new(0.5,0), BottomRightRadius=UDim.new(0.5,0), TopLeftRadius=UDim.new(0.5,0), TopRightRadius=UDim.new(0.5,0) } },
+		{ Path = "Emote/Wheel2/Emote1/Number/UIStroke", Class = "UIStroke", Props = { Thickness=2, Transparency=0.5 } },
+		{ Path = "Emote/Wheel2/Emote1/TextLabel/UIStroke", Class = "UIStroke", Props = { Thickness=2, Transparency=0.5 } },
+		{ Path = "Emote/Wheel2/Emote2/Button/UICorner", Class = "UICorner", Props = { BottomLeftRadius=UDim.new(0.5,0), BottomRightRadius=UDim.new(0.5,0), TopLeftRadius=UDim.new(0.5,0), TopRightRadius=UDim.new(0.5,0) } },
+		{ Path = "Emote/Wheel2/Emote2/Number/UIStroke", Class = "UIStroke", Props = { Thickness=2, Transparency=0.5 } },
+		{ Path = "Emote/Wheel2/Emote2/TextLabel/UIStroke", Class = "UIStroke", Props = { Thickness=2, Transparency=0.5 } },
+		{ Path = "Emote/Wheel2/Emote3/Button/UICorner", Class = "UICorner", Props = { BottomLeftRadius=UDim.new(0.5,0), BottomRightRadius=UDim.new(0.5,0), TopLeftRadius=UDim.new(0.5,0), TopRightRadius=UDim.new(0.5,0) } },
+		{ Path = "Emote/Wheel2/Emote3/Number/UIStroke", Class = "UIStroke", Props = { Thickness=2, Transparency=0.5 } },
+		{ Path = "Emote/Wheel2/Emote3/TextLabel/UIStroke", Class = "UIStroke", Props = { Thickness=2, Transparency=0.5 } },
+		{ Path = "Emote/Wheel2/Emote4/Button/UICorner", Class = "UICorner", Props = { BottomLeftRadius=UDim.new(0.5,0), BottomRightRadius=UDim.new(0.5,0), TopLeftRadius=UDim.new(0.5,0), TopRightRadius=UDim.new(0.5,0) } },
+		{ Path = "Emote/Wheel2/Emote4/Number/UIStroke", Class = "UIStroke", Props = { Thickness=2, Transparency=0.5 } },
+		{ Path = "Emote/Wheel2/Emote4/TextLabel/UIStroke", Class = "UIStroke", Props = { Thickness=2, Transparency=0.5 } },
+		{ Path = "Emote/Wheel2/Emote5/Button/UICorner", Class = "UICorner", Props = { BottomLeftRadius=UDim.new(0.5,0), BottomRightRadius=UDim.new(0.5,0), TopLeftRadius=UDim.new(0.5,0), TopRightRadius=UDim.new(0.5,0) } },
+		{ Path = "Emote/Wheel2/Emote5/Number/UIStroke", Class = "UIStroke", Props = { Thickness=2, Transparency=0.5 } },
+		{ Path = "Emote/Wheel2/Emote5/TextLabel/UIStroke", Class = "UIStroke", Props = { Thickness=2, Transparency=0.5 } },
+		{ Path = "Emote/Wheel2/Emote6/Button/UICorner", Class = "UICorner", Props = { BottomLeftRadius=UDim.new(0.5,0), BottomRightRadius=UDim.new(0.5,0), TopLeftRadius=UDim.new(0.5,0), TopRightRadius=UDim.new(0.5,0) } },
+		{ Path = "Emote/Wheel2/Emote6/Number/UIStroke", Class = "UIStroke", Props = { Thickness=2, Transparency=0.5 } },
+		{ Path = "Emote/Wheel2/Emote6/TextLabel/UIStroke", Class = "UIStroke", Props = { Thickness=2, Transparency=0.5 } },
+		{ Path = "Emote/Wheel/DoubleSlots/TextButton/TextLabel/UIStroke", Class = "UIStroke", Props = { Thickness=2, Transparency=0.5 } },
+		{ Path = "Emote/Wheel2/DoubleSlots/TextButton/TextLabel/UIStroke", Class = "UIStroke", Props = { Thickness=2, Transparency=0.5 } },
 	},
 }
 --------------------------------------------------------------------------------
@@ -4789,6 +5170,24 @@ function UI.BuildMobile(maid, hudGui)
 			h(crouchDown)
 		end
 	end))
+	-- EmoteButton: same as the Emote key (opens the wheel, or stops the current emote)
+	local emote = by["Mobile/Right/Mobile/EmoteButton"]
+	if emote then
+		emote.Visible = CONFIG.Emotes.Enabled and #CONFIG.Emotes.List > 0
+		maid:Give(emote.MouseButton1Down:Connect(function()
+			buttonActive(emote, true)
+		end))
+		maid:Give(emote.MouseButton1Up:Connect(function()
+			buttonActive(emote, false)
+		end))
+		maid:Give(emote.Activated:Connect(function()
+			buttonActive(emote, false)
+			local h = UI.MobileHandlers.Emote
+			if h then
+				h()
+			end
+		end))
+	end
 	-- ChangePovButton: held button (press -> ThirdPerson down; release -> up)
 	local povDown = false
 	local function povRelease()
@@ -4869,7 +5268,149 @@ function UI.BuildMobile(maid, hudGui)
 			end
 		end))
 	end
-	Log.info("UI", "mobile buttons mounted (Crouch / POV / Menu)")
+	Log.info("UI", "mobile buttons mounted (Crouch / POV / Menu / Emote)")
+end
+
+--------------------------------------------------------------------------------
+-- Emote wheel: Evade's HUD/Interactors/Popups/Emote frame, driven the way its Emote popup module drives
+-- it (Init / SetEquipped / KeyUsed).  Slots 1-6 on Wheel, 7-12 on Wheel2; DoubleSlots flips pages.
+-- UI.EmoteHandlers.Activate(slot) is set by bindInput.
+--------------------------------------------------------------------------------
+UI.EmoteHandlers = {}
+
+function UI.BuildEmoteWheel(maid, hudGui)
+	if not CONFIG.Emotes.Enabled then
+		return
+	end
+	local root, by = buildRows(EVADE_UI.EmoteWheel)
+	if not root then
+		return
+	end
+	root.Visible = false
+	root.Parent = hudGui:FindFirstChild("HUD") or hudGui
+	UI.EmoteFrame = root
+	local wheel, wheel2 = by["Emote/Wheel"], by["Emote/Wheel2"]
+	UI.EmoteWheels = { wheel, wheel2 }
+	-- ESTIMATED: Evade's popup container keeps the wheel square; here the frame fills the screen.
+	for _, w in UI.EmoteWheels do
+		local c = Instance.new("UIAspectRatioConstraint")
+		c.Parent = w
+	end
+	local keyboard = not touchOnly()
+	local list = CONFIG.Emotes.List
+	local twoPages = false
+	for i = 1, 12 do
+		local w = i <= 6 and wheel or wheel2
+		local j = i <= 6 and i or i - 6
+		local slot, ring = w:FindFirstChild("Emote" .. j), w:FindFirstChild("Ring" .. j)
+		local entry = list[i]
+		if entry and i > 6 then
+			twoPages = true
+		end
+		if slot then
+			slot.TextLabel.Text = entry and entry.Name or "None" -- MEASURED SetEquipped
+			-- MEASURED SetEquipped: keyboard shows the rings; touch shows filled buttons instead.
+			slot.Button.BackgroundTransparency = keyboard and 1 or 0.2
+			maid:Give(slot.Button.MouseEnter:Connect(function()
+				ring.ImageColor3 = Color3.new(1, 1, 1)
+			end))
+			maid:Give(slot.Button.MouseLeave:Connect(function()
+				ring.ImageColor3 = Color3.fromRGB(15, 15, 15)
+			end))
+			maid:Give(slot.Button.Activated:Connect(function()
+				if entry and UI.EmoteHandlers.Activate then
+					UI.EmoteHandlers.Activate(i)
+				end
+				ring.ImageColor3 = Color3.fromRGB(15, 15, 15)
+			end))
+		end
+	end
+	for _, w in UI.EmoteWheels do
+		for _, ch in w:GetChildren() do
+			if ch:IsA("ImageLabel") and ch.Name ~= "Mover" then
+				ch.ImageTransparency = keyboard and 0 or 1
+			end
+		end
+		-- MEASURED labelPageKey: the page key hint only shows on keyboard
+		local hint = w.DoubleSlots.TextButton:FindFirstChild("TextLabel")
+		if hint then
+			hint.Text = keyboard and ("[" .. CONFIG.Keys.EmotePage[1].Name .. "]") or ""
+			hint.Visible = keyboard
+		end
+	end
+	wheel.DoubleSlots.Visible = twoPages
+	maid:Give(wheel.DoubleSlots.TextButton.Activated:Connect(function()
+		wheel.Visible, wheel2.Visible = false, true
+	end))
+	maid:Give(wheel2.DoubleSlots.TextButton.Activated:Connect(function()
+		wheel2.Visible, wheel.Visible = false, true
+	end))
+	UI.EmoteModal = wheel:FindFirstChild("Emote1") and wheel.Emote1.Button
+	Log.info("UI", ("emote wheel mounted (%d emotes)"):format(#list))
+end
+
+function UI.ToggleEmoteWheel(open)
+	local frame = UI.EmoteFrame
+	if not frame then
+		return
+	end
+	if open == nil then
+		open = not frame.Visible
+	end
+	if frame.Visible == open then
+		return
+	end
+	frame.Visible = open
+	Shared.EmoteWheelOpen = open
+	if UI.EmoteModal then
+		UI.EmoteModal.Modal = open -- frees the locked mouse in first person
+	end
+	-- While open, 1-6 and the page key belong to the wheel: bound at high priority and sunk, so the
+	-- Roblox hotbar (also on 1-9) doesn't equip a tool at the same time.
+	UI.EmoteActionName = UI.EmoteActionName or hiddenName()
+	if open then
+		UserInputService.MouseBehavior = Enum.MouseBehavior.Default
+		local keys = { Enum.KeyCode.One, Enum.KeyCode.Two, Enum.KeyCode.Three, Enum.KeyCode.Four, Enum.KeyCode.Five, Enum.KeyCode.Six }
+		for _, k in CONFIG.Keys.EmotePage do
+			table.insert(keys, k)
+		end
+		pcall(function()
+			ContextActionService:BindActionAtPriority(UI.EmoteActionName, function(_, state, input)
+				if state == Enum.UserInputState.Begin then
+					UI.EmoteWheelKey(input)
+				end
+				return Enum.ContextActionResult.Sink
+			end, false, Enum.ContextActionPriority.High.Value + 1000, table.unpack(keys))
+		end)
+	else
+		pcall(ContextActionService.UnbindAction, ContextActionService, UI.EmoteActionName)
+	end
+end
+
+-- MEASURED KeyUsed: while the wheel is open, the page key flips pages and 1-6 pick a slot on the shown page.
+function UI.EmoteWheelKey(input)
+	local frame = UI.EmoteFrame
+	if not (frame and frame.Visible) then
+		return false
+	end
+	local wheel, wheel2 = UI.EmoteWheels[1], UI.EmoteWheels[2]
+	if table.find(CONFIG.Keys.EmotePage, input.KeyCode) then
+		if wheel.DoubleSlots.Visible then
+			wheel.Visible, wheel2.Visible = not wheel.Visible, not wheel2.Visible
+		end
+		return true
+	end
+	local n = ({ [Enum.KeyCode.One] = 1, [Enum.KeyCode.Two] = 2, [Enum.KeyCode.Three] = 3, [Enum.KeyCode.Four] = 4, [Enum.KeyCode.Five] = 5, [Enum.KeyCode.Six] = 6 })[input.KeyCode]
+	if not n then
+		return false
+	end
+	if wheel2.Visible then
+		n += 6
+	end
+	if CONFIG.Emotes.List[n] and UI.EmoteHandlers.Activate then
+		UI.EmoteHandlers.Activate(n)
+	end
+	return true
 end
 
 -- CharacterStatus.SetSpeed: floor to 0.1, comma format, resize Front to text width. No tween.
@@ -4918,6 +5459,9 @@ end
 function UI.SetVisible(visible)
 	if UI.Elements.Root then
 		UI.Elements.Root.Visible = visible
+	end
+	if not visible then
+		UI.ToggleEmoteWheel(false) -- death closes the wheel (DisableAfterDeath)
 	end
 end
 
@@ -5023,6 +5567,7 @@ function Character:Init()
 	self.Animator = Animator.new(self)
 	self.Animator:Init(self.Maid)
 	self.Animator:OnStateChanged(self.Registry:Get("State"))
+	self.Emote = Emote.new(self, self.Maid)
 
 	self.Maid:Give(hum.Died:Connect(function()
 		UI.SetVisible(false)
@@ -5082,6 +5627,7 @@ function Character:Update(dt)
 	self.Movement:Update(dt)
 	self.Camera:UpdateType()
 	self.Animator:Update(dt)
+	self.Emote:Update()
 	Remotes.Flush()
 	self.Camera:Update(dt)
 
@@ -5400,6 +5946,7 @@ end
 local App = { Maid = Maid.new(), Current = nil }
 
 local function teardownCharacter()
+	UI.ToggleEmoteWheel(false)
 	if App.Current then
 		App.Current:Destroy()
 		App.Current = nil
@@ -5480,8 +6027,33 @@ local function bindInput()
 			c.Registry:Set("CrouchKey", true)
 		elseif isKey(CONFIG.Keys.ThirdPerson, input) then
 			c.Camera:ToggleThirdPerson()
+		elseif isKey(CONFIG.Keys.Emote, input) then
+			UI.MobileHandlers.Emote() -- wheel keys (1-6, page) are bound while it is open (UI.ToggleEmoteWheel)
 		end
 	end))
+	-- Emote key (MEASURED CanActivate): while emoting it stops the emote; otherwise it opens or closes the
+	-- wheel (not within the 1.5 s cooldown).  Picking a slot always closes the wheel.
+	UI.MobileHandlers.Emote = function()
+		local c = App.Current
+		if not (c and c.Emote) or not CONFIG.Emotes.Enabled then
+			return
+		end
+		if c.Emote:IsPlaying() then
+			c.Emote:Stop()
+			UI.ToggleEmoteWheel(false)
+		elseif UI.EmoteFrame and UI.EmoteFrame.Visible then
+			UI.ToggleEmoteWheel(false)
+		elseif os.clock() - c.Emote.LastActivated > CONFIG.Emotes.Cooldown and c.Humanoid.Health > 0 then
+			UI.ToggleEmoteWheel(true)
+		end
+	end
+	UI.EmoteHandlers.Activate = function(slot)
+		local c = App.Current
+		if c and c.Emote then
+			c.Emote:Activate(slot)
+		end
+		UI.ToggleEmoteWheel(false)
+	end
 	App.Maid:Give(UserInputService.InputBegan:Connect(function(input, processed)
 		if input.KeyCode == CONFIG.Keys.Settings and not processed then
 			UI.ToggleSettings()
@@ -5511,14 +6083,14 @@ local function bindInput()
 		cameraTouches[input] = nil
 	end))
 	App.Maid:Give(UserInputService.InputChanged:Connect(function(input, processed)
-		if input.UserInputType == Enum.UserInputType.Touch and cameraTouches[input] and not Shared.SettingsOpen then
+		if input.UserInputType == Enum.UserInputType.Touch and cameraTouches[input] and not menuOpen() then
 			Shared.TouchDelta += Vector2.new(input.Delta.X, input.Delta.Y)
 		end
 		local c = App.Current
 		if not c then
 			return
 		end
-		if input.UserInputType == Enum.UserInputType.MouseWheel and not processed and not Shared.SettingsOpen then
+		if input.UserInputType == Enum.UserInputType.MouseWheel and not processed and not menuOpen() then
 			c.Camera:OnWheel(input.Position.Z)
 		elseif input.KeyCode == Enum.KeyCode.Thumbstick2 then
 			c.Camera.GamepadLook = Vector2.new(input.Position.X, input.Position.Y)
