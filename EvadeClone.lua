@@ -126,6 +126,9 @@ local CONFIG = {
 		WalkSpeedMultiplier = 1,
 		JumpSpeedMultiplier = 1.45,
 		BhopEnabled = false,
+		-- custom (settings menu "Hold to Bhop"): holding jump jumps again on every landing.  Evade makes you
+		-- press jump for each hop (JumpReact blocks the next jump until the key is released).
+		HoldToBhop = false,
 		GroundedDistCheck = 2.9,
 		-- MEASURED engine constants (Movement / Functions / Constraints / StateInfo)
 		VelocityScale = 90, -- PlaneVelocity = V / 90
@@ -2373,6 +2376,10 @@ function Movement:JumpReact(fromGamepad)
 	RunService.Heartbeat:Wait()
 	while self.JumpHeldDown and self._jumpToken == token and not self.Destroyed do
 		RunService.Heartbeat:Wait()
+		-- Hold to Bhop: jump again on landing while the key is still held (same as re-pressing it).
+		if CONFIG.Movement.HoldToBhop and self.JumpHeldDown and not self.Destroyed and self.R:Get("Grounded") and os.clock() - (self.LastJumpTime or 0) > 0.15 then
+			self:AttemptJump()
+		end
 	end
 	if self._jumpToken == token then
 		self.CanJump = true
@@ -2429,6 +2436,7 @@ function Movement:Jump(stats, fromGround, heightOverride)
 	end
 	self:SetJumpHeight(heightOverride or stats.JumpHeight)
 	self.Humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
+	self.LastJumpTime = os.clock()
 	self.JumpCount += 1
 	if self.State == "WallrunRight" or self.State == "WallrunLeft" then
 		R:Set("IgnoreXMove", os.clock())
@@ -4851,6 +4859,7 @@ local SETTING_ROWS = {
 	{ Type = "POVScroll", Name = "POV Scroll", Icon = "rbxassetid://8677931999", Desc = "Determines if the scroll wheel changes POV", Kind = "boolean" },
 	-- Custom (not in Evade): Evade hides the whole first-person body above FOV 90.
 	{ Type = "HighFOVBody", Name = "High FOV Body", Icon = "rbxassetid://11660911888", Desc = "Shows your legs and torso even above 90 FOV", Kind = "boolean" },
+	{ Type = "HoldToBhop", Name = "Hold to Bhop", Icon = "rbxassetid://13085201731", Desc = "Hold jump to jump again every time you land", Kind = "boolean" },
 }
 local GAME_TAB_ICON = "rbxassetid://302250236" -- MEASURED Views/Settings "Game" header icon
 
@@ -4863,6 +4872,8 @@ local function getSetting(kind)
 		return CONFIG.Camera.POVScroll
 	elseif kind == "HighFOVBody" then
 		return CONFIG.Camera.HighFOVBody
+	elseif kind == "HoldToBhop" then
+		return CONFIG.Movement.HoldToBhop
 	end
 end
 
@@ -4875,6 +4886,8 @@ local function setSetting(kind, value)
 		CONFIG.Camera.POVScroll = value == true
 	elseif kind == "HighFOVBody" then
 		CONFIG.Camera.HighFOVBody = value == true
+	elseif kind == "HoldToBhop" then
+		CONFIG.Movement.HoldToBhop = value == true
 	end
 	UI.SaveSettings()
 end
@@ -4902,11 +4915,14 @@ function UI.LoadSettings()
 	if type(data.HighFOVBody) == "boolean" then
 		CONFIG.Camera.HighFOVBody = data.HighFOVBody
 	end
+	if type(data.HoldToBhop) == "boolean" then
+		CONFIG.Movement.HoldToBhop = data.HoldToBhop
+	end
 end
 
 function UI.SaveSettings()
 	local ok, text = pcall(function()
-		return HttpService:JSONEncode({ FOV = CONFIG.Camera.BaseFOV, Viewbob = CONFIG.Camera.Viewbob, POVScroll = CONFIG.Camera.POVScroll, HighFOVBody = CONFIG.Camera.HighFOVBody })
+		return HttpService:JSONEncode({ FOV = CONFIG.Camera.BaseFOV, Viewbob = CONFIG.Camera.Viewbob, POVScroll = CONFIG.Camera.POVScroll, HighFOVBody = CONFIG.Camera.HighFOVBody, HoldToBhop = CONFIG.Movement.HoldToBhop })
 	end)
 	if ok then
 		Assets.WriteFile(Assets.Path(SETTINGS_FILE), text)
