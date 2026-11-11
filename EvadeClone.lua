@@ -233,6 +233,18 @@ local CONFIG = {
 	-- touch devices without a keyboard, like Evade's InteractType "Mobile".
 	UI = { Enabled = true, ForceMobile = false },
 
+	-- Animation sync between script users.  Joint transforms never replicate, but AnimationTracks played
+	-- on your own character do (AnimationId, WeightTarget, Speed), even when the asset can't load.  Each
+	-- keyframe track plays a "carrier" track with its Evade animation ID (from the .rbxm file name); other
+	-- clients running the script read those carriers and play the same clips on your character locally.
+	Sync = {
+		Enabled = true,
+		MinSendInterval = 0.1, -- seconds between weight/speed updates per track (only when changed)
+		WeightEpsilon = 0.03,
+		SpeedEpsilon = 0.05,
+		RemoteFade = 0.15, -- fade used on the receiving side
+	},
+
 	Remotes = {
 		-- "Count" = listen-only, outgoing registry terms are counted, never sent (default, safe).
 		-- "Fire"  = FireServer(table) on the mapped outgoing remote (only for remotes YOU own).
@@ -3199,8 +3211,20 @@ local function sampleCurve(list, t)
 	return a[2]:Lerp(b[2], alpha)
 end
 
+-- Compiled curves are shared: remote players reuse the same clips, so compile each KeyframeSequence once.
+local compiledCache = setmetatable({}, { __mode = "k" })
+local function compileCached(ks)
+	local c = compiledCache[ks]
+	if not c then
+		local curves, length = compileSequence(ks)
+		c = { curves, length }
+		compiledCache[ks] = c
+	end
+	return c[1], c[2]
+end
+
 function KPTrack.new(player, ks, name)
-	local curves, length = compileSequence(ks)
+	local curves, length = compileCached(ks)
 	return setmetatable({
 		Player = player,
 		Curves = curves,
@@ -3223,6 +3247,51 @@ function KPTrack:SetTarget(target, fade)
 	self.FadeRate = fade > 0 and math.max(math.abs(target - self.WeightCurrent), 1e-3) / fade or math.huge
 end
 
+-- Carrier (sync): a real AnimationTrack on our own Animator that mirrors this track so other script
+-- users can read it.  Weight/speed updates are throttled to real changes.
+function KPTrack:SetMirror(track)
+	self.Mirror = track
+	self.MirrorSent = { W = -1, S = -1, T = 0, Playing = false }
+end
+
+function KPTrack:SyncMirror(force)
+	local m = self.Mirror
+	if not m then
+		return
+	end
+	local sent, cfg = self.MirrorSent, CONFIG.Sync
+	local playing = self.IsPlaying and self.WeightTarget > 0
+	if playing ~= sent.Playing then
+		sent.Playing = playing
+		pcall(function()
+			if playing then
+				m:Play(DEFAULT_FADE, math.max(self.WeightTarget, 0.001), self.Speed)
+			else
+				m:Stop(DEFAULT_FADE)
+			end
+		end)
+		sent.W, sent.S, sent.T = self.WeightTarget, self.Speed, os.clock()
+		return
+	end
+	if not playing then
+		return
+	end
+	local now = os.clock()
+	if not force and now - sent.T < cfg.MinSendInterval then
+		return
+	end
+	if math.abs(self.WeightTarget - sent.W) > cfg.WeightEpsilon then
+		sent.W = self.WeightTarget
+		pcall(m.AdjustWeight, m, math.max(sent.W, 0.001), DEFAULT_FADE)
+		sent.T = now
+	end
+	if math.abs(self.Speed - sent.S) > cfg.SpeedEpsilon then
+		sent.S = self.Speed
+		pcall(m.AdjustSpeed, m, sent.S)
+		sent.T = now
+	end
+end
+
 function KPTrack:Play(fade, weight, speed)
 	if not self.IsPlaying then
 		self.TimePosition = 0
@@ -3231,26 +3300,37 @@ function KPTrack:Play(fade, weight, speed)
 	end
 	self.Speed = speed or 1
 	self:SetTarget(weight or 1, fade)
+	self:SyncMirror(true)
 end
 
 function KPTrack:Stop(fade)
 	if self.IsPlaying then
 		self:SetTarget(0, fade)
 	end
+	self:SyncMirror(true)
 end
 
 function KPTrack:AdjustSpeed(speed)
 	self.Speed = speed or 1
+	self:SyncMirror(false)
 end
 
 function KPTrack:AdjustWeight(weight, fade)
 	self:SetTarget(weight or 1, fade)
+	self:SyncMirror(false)
 end
 
 function KPTrack:Destroy()
 	self.IsPlaying = false
 	self.WeightCurrent = 0
 	self.Player.Active[self] = nil
+	if self.Mirror then
+		pcall(function()
+			self.Mirror:Stop(0)
+			self.Mirror:Destroy()
+		end)
+		self.Mirror = nil
+	end
 end
 
 function KPTrack:Step(dt)
@@ -3275,6 +3355,9 @@ function KPTrack:Step(dt)
 		end
 	end
 	self.TimePosition = t
+	if self.Mirror then
+		self:SyncMirror(false) -- flushes throttled changes and the natural end of non-looped tracks
+	end
 end
 
 local KeyframePlayer = {}
@@ -3426,6 +3509,128 @@ function KeyframePlayer:Step(dt)
 	end
 end
 
+-- Animation sync between EvadeClone users.  Motor6D.Transform never replicates, but AnimationTracks
+-- played on your own Animator do (id, weight, speed), even when the asset fails to load.  Every
+-- KeyframePlayer track mirrors itself onto a "carrier" track using Evade's AnimationClassic id (taken
+-- from the .rbxm file name); other clients running this script read those carriers and play the same
+-- KeyframeSequences on that player's R6 rig locally.
+local Sync = {}
+
+function Sync.IdFromFile(fileName)
+	return type(fileName) == "string" and string.match(fileName, "_(%d+)%.rbxm$") or nil
+end
+
+function Sync.Init(appMaid)
+	local cfg = CONFIG.Sync
+	if not cfg.Enabled then
+		return
+	end
+	local idMap = {}
+	for slot, fileName in AnimationMap do
+		local id = fileName and Sync.IdFromFile(fileName)
+		if id then
+			local ok, _, source, ks = pcall(Assets.ResolveAnimation, slot, fileName)
+			if ok and ks and source == "KeyframePlayer" then
+				idMap[id] = ks
+			end
+		end
+	end
+	if next(idMap) == nil then
+		Log.info("Sync", "no keyframe animations to sync")
+		return
+	end
+	local remotes = {} -- [player] = { char, maid, kp, tracks = {[id]=KPTrack}, playing = {[id]=bool} }
+
+	local function drop(player)
+		local r = remotes[player]
+		if r then
+			remotes[player] = nil
+			for _, t in r.tracks do
+				pcall(t.Destroy, t)
+			end
+			r.maid:Clean()
+		end
+	end
+
+	local function scan(player)
+		local char = player.Character
+		local hum = char and char:FindFirstChildOfClass("Humanoid")
+		local animator = hum and hum:FindFirstChildOfClass("Animator")
+		local r = remotes[player]
+		if r and r.char ~= char then
+			drop(player)
+			r = nil
+		end
+		if not (animator and hum.RigType == Enum.HumanoidRigType.R6) then
+			return
+		end
+		local seen = {}
+		local ok, tracks = pcall(animator.GetPlayingAnimationTracks, animator)
+		if not ok then
+			return
+		end
+		for _, at in tracks do
+			local anim = at.Animation
+			local id = anim and string.match(anim.AnimationId, "(%d+)$")
+			if id and idMap[id] then
+				seen[id] = at
+			end
+		end
+		if not r then
+			if next(seen) == nil then
+				return
+			end
+			local maid = Maid.new()
+			r = { char = char, maid = maid, kp = KeyframePlayer.new(char, maid), tracks = {}, playing = {} }
+			remotes[player] = r
+			Log.info("Sync", ("animating %s (EvadeClone user)"):format(player.Name))
+		end
+		for id, at in seen do
+			local t = r.tracks[id]
+			if not t then
+				t = r.kp:NewTrack(idMap[id], "sync" .. id)
+				r.tracks[id] = t
+			end
+			local w, s = math.max(at.WeightTarget, 0.001), at.Speed
+			if not r.playing[id] then
+				r.playing[id] = true
+				t:Play(cfg.RemoteFade, w, s)
+			else
+				if math.abs(t.WeightTarget - w) > 1e-3 then
+					t:AdjustWeight(w, cfg.RemoteFade)
+				end
+				if math.abs(t.Speed - s) > 1e-3 then
+					t:AdjustSpeed(s)
+				end
+			end
+		end
+		for id, t in r.tracks do
+			if r.playing[id] and not seen[id] then
+				r.playing[id] = false
+				t:Stop(cfg.RemoteFade)
+			end
+		end
+	end
+
+	appMaid:Give(RunService.Heartbeat:Connect(function()
+		for _, player in Players:GetPlayers() do
+			if player ~= LocalPlayer then
+				local ok, err = pcall(scan, player)
+				if not ok then
+					Log.warnOnce("sync:" .. tostring(err), "Sync", "remote scan error: " .. tostring(err))
+				end
+			end
+		end
+	end))
+	appMaid:Give(Players.PlayerRemoving:Connect(drop))
+	appMaid:Give(function()
+		for player in remotes do
+			drop(player)
+		end
+	end)
+end
+
+
 local Animator = {}
 Animator.__index = Animator
 
@@ -3517,6 +3722,21 @@ function Animator:LoadTrack(slot, fileName, maid)
 		local track = self.KeyframePlayer:NewTrack(ks, string.match(slot, "([^/]+)$"))
 		if CONFIG.Animation.ForceEstimatedPriority then
 			track.Priority = self:EstimatedPriority(slot) or track.Priority
+		end
+		-- Sync carrier: a real AnimationTrack with this clip's Evade ID, which replicates to other clients.
+		local syncId = CONFIG.Sync.Enabled and Sync.IdFromFile(fileName)
+		if syncId then
+			local carrierAnim = Instance.new("Animation")
+			carrierAnim.Name = hiddenName()
+			carrierAnim.AnimationId = "rbxassetid://" .. syncId
+			maid:Give(carrierAnim)
+			local ok, carrier = pcall(self.AnimatorInstance.LoadAnimation, self.AnimatorInstance, carrierAnim)
+			if ok and carrier then
+				carrier.Priority = Enum.AnimationPriority.Core
+				carrier.Looped = true
+				self.OwnedTracks[carrier] = true
+				track:SetMirror(carrier)
+			end
 		end
 		self.OwnedTracks[track] = true
 		self.SlotByTrack[track] = slot
@@ -5378,6 +5598,7 @@ local function main()
 	Input.Init()
 	installRemoteHandlers()
 	Remotes.Init(App.Maid)
+	Sync.Init(App.Maid)
 	bindInput()
 
 	if CONFIG.Mode == "CLONE" then
