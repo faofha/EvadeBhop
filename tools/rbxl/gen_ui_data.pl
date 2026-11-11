@@ -22,7 +22,7 @@ my $mobileKeep = sub {
     my $p = shift;
     return 1 if $p =~ m{^Mobile(/Left|/Right)?(/Mobile)?$};
     return 1 if $p =~ m{^Mobile/Left/UI};
-    return 1 if $p =~ m{^Mobile/(Left/Mobile/(ChangePovButton|MenuButton)|Right/Mobile/CrouchButton)(/|$)};
+    return 1 if $p =~ m{^Mobile/(Left/Mobile/(ChangePovButton|MenuButton)|Right/Mobile/(CrouchButton|EmoteButton))(/|$)};
     return 0;
 };
 print "-- Generated from Evade's place file with tools/rbxl/rbxl_reader.luau (export). Do not edit by hand.\n";
@@ -32,4 +32,6 @@ for ([ "SettingsView", "exp_view_settings.luau" ], [ "Slider", "exp_slider.luau"
     print "\t$_->[0] = {\n", rows($_->[1]), "\t},\n";
 }
 print "\tMobile = {\n", rows("exp_mobile.luau", $mobileKeep), "\t},\n";
+# Emote wheel (HUD/Interactors/Popups/Emote); the slot ViewportFrames are left out.
+print "\tEmoteWheel = {\n", rows("exp_emote_wheel.luau", sub { return $_[0] !~ m{/ViewportFrame} }), "\t},\n";
 print "}\n";
