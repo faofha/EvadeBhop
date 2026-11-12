@@ -2088,6 +2088,7 @@ function Movement:WallImpact(V)
 	params.FilterDescendantsInstances = filter
 	params.IgnoreWater = true
 	params.CollisionGroup = root.CollisionGroup
+	params.RespectCanCollide = true -- non-collidable parts (triggers, invisible zones) are not walls
 	local size = self.Ctx:HullSize()
 	local rot = root.CFrame - root.CFrame.Position
 	local hullCF = CFrame.new(self.Ctx:HullCenter()) * rot
@@ -2788,6 +2789,29 @@ function CameraFX:ApplyFirstPersonVisibility()
 	end
 end
 
+-- First part between focus and the camera that may block the view (Roblox Popper canOcclude rule:
+-- CanCollide, Transparency < 0.25 including LocalTransparencyModifier, not a TrussPart).  Parts that
+-- don't qualify are added to the exclude list and the ray is cast again.
+local function cameraOccluder(origin, dir, character)
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	local exclude = { character }
+	for _ = 1, 16 do
+		params.FilterDescendantsInstances = exclude
+		local hit = workspace:Raycast(origin, dir, params)
+		if not hit then
+			return nil
+		end
+		local part = hit.Instance
+		local transparency = 1 - (1 - part.Transparency) * (1 - part.LocalTransparencyModifier)
+		if part.CanCollide and transparency < 0.25 and not part:IsA("TrussPart") then
+			return hit
+		end
+		table.insert(exclude, part)
+	end
+	return nil
+end
+
 -- Third person: shift-lock style camera (Evade ShiftLockOffset (2, 0.5, 0)), mouse turns it directly.
 -- Runs before the frame reads LookCFrame, so movement uses this frame's camera direction.
 function CameraFX:UpdateThirdPerson(dt)
@@ -2848,12 +2872,10 @@ function CameraFX:UpdateThirdPerson(dt)
 	if torsoRot and torsoRot.Position.Magnitude <= 10 then
 		desired *= CFrame.new(torsoRot.Position * (self.Emoting and 0.2 or c.ThirdPersonRootOffset))
 	end
-	-- keep the camera out of walls
-	local params = RaycastParams.new()
-	params.FilterType = Enum.RaycastFilterType.Exclude
-	params.FilterDescendantsInstances = { ctx.Character }
+	-- keep the camera out of walls.  Like Roblox's Poppercam, only solid, mostly opaque parts block it
+	-- (CanCollide on, Transparency < 0.25); invisible or non-collidable parts are passed through.
 	local dir = desired.Position - focus
-	local hit = dir.Magnitude > 1e-3 and workspace:Raycast(focus, dir, params)
+	local hit = dir.Magnitude > 1e-3 and cameraOccluder(focus, dir, ctx.Character)
 	if hit then
 		desired = rot + (hit.Position - dir.Unit * 0.3)
 	end
