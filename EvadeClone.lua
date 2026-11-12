@@ -239,6 +239,14 @@ local CONFIG = {
 	-- touch devices without a keyboard, like Evade's InteractType "Mobile".
 	UI = { Enabled = true, ForceMobile = false },
 
+	-- Feature switches (settings menu, saved).  Each one works on its own, e.g. everything off except
+	-- OthersAnimations = a normal Roblox character that still sees other script users' animations.
+	Features = {
+		EvadeCharacter = true, -- Evade movement (bhop), camera, animations and emotes; off = normal Roblox character
+		HUD = true, -- speed meter, health bar and mobile buttons (the mobile MENU button always stays)
+		OthersAnimations = true, -- play other script users' synced animations and emotes on their characters
+	},
+
 	-- Animation sync between script users.  Joint transforms never replicate, but AnimationTracks played
 	-- on your own character do (AnimationId, WeightTarget, Speed), even when the asset can't load.  Each
 	-- keyframe track plays a "carrier" track with its Evade animation ID (from the .rbxm file name); other
@@ -2791,8 +2799,15 @@ function CameraFX:UpdateThirdPerson(dt)
 	if not menuOpen() then
 		local d = Vector2.zero
 		if not touchOnly() then -- on touch devices mouse delta also carries the joystick drag
-			UserInputService.MouseBehavior = Enum.MouseBehavior.LockCenter
-			d = UserInputService:GetMouseDelta()
+			if self.Emoting then
+				-- emoting: the mouse is free; holding right-click turns the camera
+				local rmb = UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton2)
+				UserInputService.MouseBehavior = rmb and Enum.MouseBehavior.LockCurrentPosition or Enum.MouseBehavior.Default
+				d = rmb and UserInputService:GetMouseDelta() or Vector2.zero
+			else
+				UserInputService.MouseBehavior = Enum.MouseBehavior.LockCenter
+				d = UserInputService:GetMouseDelta()
+			end
 		end
 		local sens = 1
 		pcall(function()
@@ -2869,7 +2884,7 @@ function CameraFX:UpdateType()
 	-- Both camera types keep the mouse locked (Evade: first person and shift-lock third person).
 	-- Roblox's camera caches the mode it last set and won't reapply it after anything else changes it,
 	-- so the lock is enforced here every frame; the settings panel frees it while open.
-	if not menuOpen() and not touchOnly() and UserInputService.MouseBehavior ~= Enum.MouseBehavior.LockCenter then
+	if not menuOpen() and not self.Emoting and not touchOnly() and UserInputService.MouseBehavior ~= Enum.MouseBehavior.LockCenter then
 		UserInputService.MouseBehavior = Enum.MouseBehavior.LockCenter
 	end
 end
@@ -3873,6 +3888,12 @@ function Sync.Init(appMaid)
 	end
 
 	appMaid:Give(RunService.Heartbeat:Connect(function()
+		if not CONFIG.Features.OthersAnimations then
+			for player in remotes do
+				drop(player) -- "Others' Animations" off: stop and reset their rigs
+			end
+			return
+		end
 		for _, player in Players:GetPlayers() do
 			if player ~= LocalPlayer then
 				local ok, err = pcall(scan, player)
@@ -4565,6 +4586,7 @@ function UI.Init(maid)
 	UI.BuildSettings(maid, parent)
 	UI.BuildMobile(maid, gui)
 	UI.BuildEmoteWheel(maid, gui)
+	UI.RefreshVisibility()
 end
 
 -- Generated from Evade's place file with tools/rbxl/rbxl_reader.luau (export). Do not edit by hand.
@@ -4860,36 +4882,46 @@ local SETTING_ROWS = {
 	-- Custom (not in Evade): Evade hides the whole first-person body above FOV 90.
 	{ Type = "HighFOVBody", Name = "High FOV Body", Icon = "rbxassetid://11660911888", Desc = "Shows your legs and torso even above 90 FOV", Kind = "boolean" },
 	{ Type = "HoldToBhop", Name = "Hold to Bhop", Icon = "rbxassetid://13085201731", Desc = "Hold jump to jump again every time you land", Kind = "boolean" },
+	{ Type = "EvadeCharacter", Name = "Evade Movement", Icon = "rbxassetid://11660911888", Desc = "Evade movement, camera, animations and emotes", Kind = "boolean" },
+	{ Type = "HUD", Name = "HUD", Icon = "rbxassetid://14333878755", Desc = "Speed meter, health bar and mobile buttons", Kind = "boolean" },
+	{ Type = "OthersAnimations", Name = "Others' Animations", Icon = "rbxassetid://8677931999", Desc = "See the animations of other players using this script", Kind = "boolean" },
 }
 local GAME_TAB_ICON = "rbxassetid://302250236" -- MEASURED Views/Settings "Game" header icon
 
+-- Where each setting lives in CONFIG (all saved to settings.json).
+local SETTING_BINDINGS = {
+	FOV = { "Camera", "BaseFOV" },
+	Viewbob = { "Camera", "Viewbob" },
+	POVScroll = { "Camera", "POVScroll" },
+	HighFOVBody = { "Camera", "HighFOVBody" },
+	HoldToBhop = { "Movement", "HoldToBhop" },
+	EvadeCharacter = { "Features", "EvadeCharacter" },
+	HUD = { "Features", "HUD" },
+	OthersAnimations = { "Features", "OthersAnimations" },
+}
+-- UI.OnSettingChanged(kind, value) is set by main() for settings that need to act immediately.
+
 local function getSetting(kind)
-	if kind == "FOV" then
-		return CONFIG.Camera.BaseFOV
-	elseif kind == "Viewbob" then
-		return CONFIG.Camera.Viewbob
-	elseif kind == "POVScroll" then
-		return CONFIG.Camera.POVScroll
-	elseif kind == "HighFOVBody" then
-		return CONFIG.Camera.HighFOVBody
-	elseif kind == "HoldToBhop" then
-		return CONFIG.Movement.HoldToBhop
-	end
+	local b = SETTING_BINDINGS[kind]
+	return b and CONFIG[b[1]][b[2]]
 end
 
 local function setSetting(kind, value)
-	if kind == "FOV" then
-		CONFIG.Camera.BaseFOV = clamp(math.floor(tonumber(value) or 70), CONFIG.Camera.FOVMin, CONFIG.Camera.FOVMax)
-	elseif kind == "Viewbob" then
-		CONFIG.Camera.Viewbob = value == true
-	elseif kind == "POVScroll" then
-		CONFIG.Camera.POVScroll = value == true
-	elseif kind == "HighFOVBody" then
-		CONFIG.Camera.HighFOVBody = value == true
-	elseif kind == "HoldToBhop" then
-		CONFIG.Movement.HoldToBhop = value == true
+	local b = SETTING_BINDINGS[kind]
+	if not b then
+		return
 	end
+	if kind == "FOV" then
+		value = clamp(math.floor(tonumber(value) or 70), CONFIG.Camera.FOVMin, CONFIG.Camera.FOVMax)
+	else
+		value = value == true
+	end
+	local changed = CONFIG[b[1]][b[2]] ~= value
+	CONFIG[b[1]][b[2]] = value
 	UI.SaveSettings()
+	if changed and UI.OnSettingChanged then
+		UI.OnSettingChanged(kind, value)
+	end
 end
 
 function UI.LoadSettings()
@@ -4903,26 +4935,25 @@ function UI.LoadSettings()
 	if not (ok and type(data) == "table") then
 		return
 	end
-	if tonumber(data.FOV) then
-		CONFIG.Camera.BaseFOV = clamp(tonumber(data.FOV), CONFIG.Camera.FOVMin, CONFIG.Camera.FOVMax)
-	end
-	if type(data.Viewbob) == "boolean" then
-		CONFIG.Camera.Viewbob = data.Viewbob
-	end
-	if type(data.POVScroll) == "boolean" then
-		CONFIG.Camera.POVScroll = data.POVScroll
-	end
-	if type(data.HighFOVBody) == "boolean" then
-		CONFIG.Camera.HighFOVBody = data.HighFOVBody
-	end
-	if type(data.HoldToBhop) == "boolean" then
-		CONFIG.Movement.HoldToBhop = data.HoldToBhop
+	for kind, b in SETTING_BINDINGS do
+		local v = data[kind]
+		if kind == "FOV" then
+			if tonumber(v) then
+				CONFIG.Camera.BaseFOV = clamp(tonumber(v), CONFIG.Camera.FOVMin, CONFIG.Camera.FOVMax)
+			end
+		elseif type(v) == "boolean" then
+			CONFIG[b[1]][b[2]] = v
+		end
 	end
 end
 
 function UI.SaveSettings()
 	local ok, text = pcall(function()
-		return HttpService:JSONEncode({ FOV = CONFIG.Camera.BaseFOV, Viewbob = CONFIG.Camera.Viewbob, POVScroll = CONFIG.Camera.POVScroll, HighFOVBody = CONFIG.Camera.HighFOVBody, HoldToBhop = CONFIG.Movement.HoldToBhop })
+		local data = {}
+		for kind in SETTING_BINDINGS do
+			data[kind] = getSetting(kind)
+		end
+		return HttpService:JSONEncode(data)
 	end)
 	if ok then
 		Assets.WriteFile(Assets.Path(SETTINGS_FILE), text)
@@ -5085,7 +5116,7 @@ function UI.ToggleSettings(open)
 		end
 	else
 		UI.SelectedSetting = nil
-		UserInputService.MouseBehavior = UI.MouseBehaviorBeforeSettings or Enum.MouseBehavior.Default
+		UserInputService.MouseBehavior = (CONFIG.Features.EvadeCharacter and UI.MouseBehaviorBeforeSettings) or Enum.MouseBehavior.Default
 		UI.SaveSettings()
 	end
 end
@@ -5172,6 +5203,8 @@ function UI.BuildMobile(maid, hudGui)
 	local crouch = by["Mobile/Right/Mobile/CrouchButton"]
 	local pov = by["Mobile/Left/Mobile/ChangePovButton"]
 	local menu = by["Mobile/Left/Mobile/MenuButton"]
+	-- hidden with the HUD / Evade Movement settings; MENU always stays so the settings stay reachable
+	UI.MobileButtons = { Crouch = crouch, ChangePov = pov, Emote = by["Mobile/Right/Mobile/EmoteButton"] }
 
 	-- CrouchButton: IgnoreHold -> every tap toggles the key
 	local crouchDown = false
@@ -5189,7 +5222,6 @@ function UI.BuildMobile(maid, hudGui)
 	-- EmoteButton: same as the Emote key (opens the wheel, or stops the current emote)
 	local emote = by["Mobile/Right/Mobile/EmoteButton"]
 	if emote then
-		emote.Visible = CONFIG.Emotes.Enabled and #CONFIG.Emotes.List > 0
 		maid:Give(emote.MouseButton1Down:Connect(function()
 			buttonActive(emote, true)
 		end))
@@ -5472,10 +5504,24 @@ function UI.SetHealth(value, maxHealth)
 	end
 end
 
-function UI.SetVisible(visible)
+-- HUD visibility = character alive (SetVisible) AND the HUD and Evade Movement settings.
+UI.Alive = true
+function UI.RefreshVisibility()
+	local show = CONFIG.Features.HUD and CONFIG.Features.EvadeCharacter
 	if UI.Elements.Root then
-		UI.Elements.Root.Visible = visible
+		UI.Elements.Root.Visible = show and UI.Alive
 	end
+	for name, button in UI.MobileButtons or {} do
+		button.Visible = show and (name ~= "Emote" or (CONFIG.Emotes.Enabled and #CONFIG.Emotes.List > 0))
+	end
+	if not CONFIG.Features.EvadeCharacter then
+		UI.ToggleEmoteWheel(false)
+	end
+end
+
+function UI.SetVisible(visible)
+	UI.Alive = visible
+	UI.RefreshVisibility()
 	if not visible then
 		UI.ToggleEmoteWheel(false) -- death closes the wheel (DisableAfterDeath)
 	end
@@ -5978,8 +6024,8 @@ local function setupCharacter(model)
 	setupToken += 1
 	local token = setupToken
 	teardownCharacter()
-	if CONFIG.Mode ~= "CLONE" then
-		return
+	if CONFIG.Mode ~= "CLONE" or not CONFIG.Features.EvadeCharacter then
+		return -- "Evade Movement" off: leave the normal Roblox character alone
 	end
 	local c = Character.new(model)
 	local ok, res = pcall(c.Init, c)
@@ -6176,6 +6222,9 @@ local function main()
 	capabilityReport()
 	GENV.EvadeClone = {
 		Unload = unload, Config = CONFIG, Version = VERSION, Validation = Validation,
+		SetSetting = function(kind, value) -- same as the settings menu, e.g. SetSetting("HUD", false)
+			setSetting(kind, value)
+		end,
 		Current = function() -- debug/testing: the live Character (Camera, Movement, Registry, ...)
 			return App.Current
 		end,
@@ -6190,6 +6239,22 @@ local function main()
 	Remotes.Init(App.Maid)
 	Sync.Init(App.Maid)
 	bindInput()
+	-- Feature switches act immediately (Evade Movement rebuilds or removes the Evade character).
+	UI.OnSettingChanged = function(kind, value)
+		if kind == "EvadeCharacter" and CONFIG.Mode == "CLONE" then
+			if value then
+				if LocalPlayer.Character then
+					task.spawn(setupCharacter, LocalPlayer.Character)
+				end
+			else
+				setupToken += 1 -- cancels a setup that is still initialising
+				teardownCharacter()
+			end
+		end
+		if kind == "EvadeCharacter" or kind == "HUD" then
+			UI.RefreshVisibility()
+		end
+	end
 
 	if CONFIG.Mode == "CLONE" then
 		UI.Init(App.Maid)
