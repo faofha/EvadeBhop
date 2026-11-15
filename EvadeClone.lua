@@ -159,15 +159,17 @@ local CONFIG = {
 		SnapEpsilon = 0.02,
 	},
 
+	-- Keybinds.  The first key of each list can be rebound in the settings menu (KEYBINDS tab, saved);
+	-- gamepad keys stay as they are.
 	Keys = { -- MEASURED: Config/Player/Controls
 		Crouch = { Enum.KeyCode.C, Enum.KeyCode.LeftControl, Enum.KeyCode.ButtonR2 },
 		ThirdPerson = { Enum.KeyCode.O, Enum.KeyCode.ButtonR3 },
-		Settings = Enum.KeyCode.P, -- opens the settings panel (FOV slider)
+		Settings = { Enum.KeyCode.P }, -- opens the settings menu
 		Emote = { Enum.KeyCode.G, Enum.KeyCode.DPadUp }, -- MEASURED: Controls "Emote"
 		EmotePage = { Enum.KeyCode.Q }, -- MEASURED: wheel page key is the "Melee" bind ([Q] in the template)
 		GamepadJump = Enum.KeyCode.ButtonA,
 		Validation = Enum.KeyCode.F8,
-		Unload = Enum.KeyCode.End,
+		Unload = { Enum.KeyCode.End },
 	},
 
 	Camera = {
@@ -2663,6 +2665,7 @@ end
 -- camera in LockFirstPerson, which already turns with the mouse.
 function CameraFX:ApplyCameraType(instant)
 	local cam = workspace.CurrentCamera
+	self.LastCameraPos = nil
 	if self.ZoomTween then
 		self.ZoomTween:Cancel()
 		self.ZoomTween = nil
@@ -2789,27 +2792,124 @@ function CameraFX:ApplyFirstPersonVisibility()
 	end
 end
 
--- First part between focus and the camera that may block the view (Roblox Popper canOcclude rule:
--- CanCollide, Transparency < 0.25 including LocalTransparencyModifier, not a TrussPart).  Parts that
--- don't qualify are added to the exclude list and the ray is cast again.
-local function cameraOccluder(origin, dir, character)
+-- Roblox Popper (PlayerModule CameraModule/ZoomController/Popper), which is what Evade's third-person
+-- camera uses (Evade runs Roblox's Classic camera).  Simplified port:
+--   * a part only occludes if CanCollide, Transparency < 0.25 (incl. LocalTransparencyModifier), not a truss;
+--   * HARD limit: the camera would end up inside the part (no exit surface between it and the camera)
+--     -> always pull in;
+--   * SOFT limit: the part sits between focus and camera but the camera is clear behind it (poles, trunks,
+--     fences) -> only pull in if the occlusion is wide (screen-space offsets are blocked too) and stays
+--     blocked along the extrapolated movement (testPromotion).  This is what stops one-frame pops.
+local Popper = {}
+local POPPER_SCAN_OFFSETS = { Vector2.new(0.4, 0), Vector2.new(-0.4, 0), Vector2.new(0, -0.4), Vector2.new(0, 0.4), Vector2.new(0, 0.2) }
+local POPPER_NEAR = 0.5 -- Camera.NearPlaneZ magnitude
+
+local function popperCanOcclude(part)
+	local t = 1 - (1 - part.Transparency) * (1 - part.LocalTransparencyModifier)
+	return t < 0.25 and part.CanCollide and not part:IsA("TrussPart")
+end
+
+-- Returns softLimit, hardLimit (math.huge when none) along origin + unitDir * dist.
+function Popper.QueryPoint(origin, unitDir, dist, lastPos, exclude)
+	local target = origin + unitDir * dist
+	local soft, hard = math.huge, math.huge
+	local base = #exclude
 	local params = RaycastParams.new()
 	params.FilterType = Enum.RaycastFilterType.Exclude
-	local exclude = { character }
-	for _ = 1, 16 do
+	local only = RaycastParams.new()
+	only.FilterType = Enum.RaycastFilterType.Include
+	local moving = origin
+	for _ = 1, 24 do
 		params.FilterDescendantsInstances = exclude
-		local hit = workspace:Raycast(origin, dir, params)
+		local hit = workspace:Raycast(moving, target - moving, params)
 		if not hit then
-			return nil
+			break
 		end
 		local part = hit.Instance
-		local transparency = 1 - (1 - part.Transparency) * (1 - part.LocalTransparencyModifier)
-		if part.CanCollide and transparency < 0.25 and not part:IsA("TrussPart") then
-			return hit
+		if popperCanOcclude(part) then
+			only.FilterDescendantsInstances = { part }
+			local lim = (hit.Position - origin).Magnitude
+			-- exit surface between the camera and the entry point -> the camera is outside the part
+			local exit = workspace:Raycast(target, hit.Position - target, only)
+			if exit then
+				local promote = lastPos ~= nil and (workspace:Raycast(lastPos, target - lastPos, only) or workspace:Raycast(target, lastPos - target, only))
+				if promote then
+					hard = lim -- the camera passed through it since last frame: treat as hard
+				elseif lim < soft then
+					soft = lim
+				end
+			else
+				hard = lim
+			end
 		end
 		table.insert(exclude, part)
+		if hard < math.huge then
+			break
+		end
+		moving = hit.Position - unitDir * 1e-3
 	end
-	return nil
+	for i = #exclude, base + 1, -1 do
+		exclude[i] = nil
+	end
+	return soft, hard
+end
+
+local function popperCollisionPoint(origin, dir, exclude)
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = exclude
+	local hit = workspace:Raycast(origin, dir, params)
+	return hit and (hit.Position - dir.Unit * 0.01) or (origin + dir)
+end
+
+function Popper.TestPromotion(focus, dist, velocity, exclude)
+	local fP, fX, fY, fZ = focus.Position, focus.RightVector, focus.UpVector, -focus.LookVector
+	-- dead reckoning: if the camera will be clear soon along the current motion, don't pull in
+	local speed = velocity.Magnitude
+	if speed > 0.1 then
+		local reach = (popperCollisionPoint(fP, velocity * 1.25, exclude) - fP).Magnitude
+		local maxT = math.min(1.25, reach / speed)
+		for t = 0, maxT, 0.0625 do
+			if Popper.QueryPoint(fP + velocity.Unit * math.min(speed * t, reach), fZ, dist, nil, exclude) >= dist then
+				return false
+			end
+		end
+	end
+	-- screen-space offsets: a narrow occluder leaves some of them clear
+	for _, o in POPPER_SCAN_OFFSETS do
+		local pos = popperCollisionPoint(fP, fX * o.X + fY * o.Y, exclude)
+		if Popper.QueryPoint(pos, (fP + fZ * dist - pos).Unit, dist, nil, exclude) == math.huge then
+			return false
+		end
+	end
+	return true
+end
+
+-- How far behind focus (along -LookVector) the camera may sit, at most targetDist.
+function Popper.Distance(focus, targetDist, character, velocity, lastPos)
+	local cam = workspace.CurrentCamera
+	local projY = 2 * math.tan(math.rad(cam.FieldOfView) / 2)
+	local vp = cam.ViewportSize
+	local projX = (vp.Y > 0 and vp.X / vp.Y or 16 / 9) * projY
+	local exclude = { character }
+	local fP, fX, fY, fZ = focus.Position, focus.RightVector, focus.UpVector, -focus.LookVector
+	local soft, hard = math.huge, math.huge
+	for vx = 0, 1 do
+		for vy = 0, 1 do
+			-- near-plane corners, so the view itself doesn't clip into walls
+			local origin = fP + POPPER_NEAR * (fX * ((vx - 0.5) * projX) + fY * ((vy - 0.5) * projY))
+			local s, h = Popper.QueryPoint(origin, fZ, targetDist, lastPos, exclude)
+			soft, hard = math.min(soft, s), math.min(hard, h)
+		end
+	end
+	local dist = targetDist
+	if hard < dist then
+		dist = hard
+	end
+	if soft < dist and Popper.TestPromotion(focus, targetDist, velocity, exclude) then
+		dist = soft
+	end
+	return math.max(dist, 0)
 end
 
 -- Third person: shift-lock style camera (Evade ShiftLockOffset (2, 0.5, 0)), mouse turns it directly.
@@ -2864,21 +2964,28 @@ function CameraFX:UpdateThirdPerson(dt)
 	-- Evade's camera subject is its root box (the hull), so the focus is hull centre + 1.5.
 	local focus = ctx.Root.Position + Vector3.new(0, 1.5 + self:HullEyeDelta(), 0)
 	local rot = CFrame.fromOrientation(self.Pitch, self.Yaw, 0)
-	local pivot = CFrame.new(focus) * rot * CFrame.new(self.Emoting and Vector3.zero or c.ThirdPersonShiftLockOffset * math.min(self.ZoomCurrent / c.ThirdPersonZoom, 1))
-	local desired = pivot * CFrame.new(0, 0, self.ZoomCurrent)
+	local offset = self.Emoting and Vector3.zero or c.ThirdPersonShiftLockOffset * math.min(self.ZoomCurrent / c.ThirdPersonZoom, 1)
 	-- MEASURED Camera/Types ThirdPerson RootOffset 0.4: camera offset by TorsoRot.Transform.p * 0.4
 	local kp = ctx.Animator and ctx.Animator.KeyframePlayer
 	local torsoRot = kp and kp.TorsoRotPose
 	if torsoRot and torsoRot.Position.Magnitude <= 10 then
-		desired *= CFrame.new(torsoRot.Position * (self.Emoting and 0.2 or c.ThirdPersonRootOffset))
+		offset += torsoRot.Position * (self.Emoting and 0.2 or c.ThirdPersonRootOffset)
 	end
-	-- keep the camera out of walls.  Like Roblox's Poppercam, only solid, mostly opaque parts block it
-	-- (CanCollide on, Transparency < 0.25); invisible or non-collidable parts are passed through.
-	local dir = desired.Position - focus
-	local hit = dir.Magnitude > 1e-3 and cameraOccluder(focus, dir, ctx.Character)
-	if hit then
-		desired = rot + (hit.Position - dir.Unit * 0.3)
+	-- the shift-lock offset must not push the pivot through a wall beside the character
+	local pivotPos = (CFrame.new(focus) * rot * CFrame.new(offset)).Position
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = { ctx.Character }
+	params.RespectCanCollide = true
+	local side = workspace:Raycast(focus, pivotPos - focus, params)
+	if side then
+		pivotPos = side.Position - (pivotPos - focus).Unit * 0.2
 	end
+	local pivot = rot + pivotPos
+	-- keep the camera out of walls the way Roblox's Popper does (see Popper above)
+	local dist = Popper.Distance(pivot, self.ZoomCurrent, ctx.Character, ctx.Root.AssemblyLinearVelocity, self.LastCameraPos)
+	local desired = pivot * CFrame.new(0, 0, dist)
+	self.LastCameraPos = desired.Position
 	cam.CFrame = desired
 	-- Roblox's first-person camera hides the character via LocalTransparencyModifier and stops
 	-- updating it while the camera is Scriptable, so show the body again here.
@@ -4909,6 +5016,32 @@ local SETTING_ROWS = {
 	{ Type = "OthersAnimations", Name = "Others' Animations", Icon = "rbxassetid://8677931999", Desc = "See the animations of other players using this script", Kind = "boolean" },
 }
 local GAME_TAB_ICON = "rbxassetid://302250236" -- MEASURED Views/Settings "Game" header icon
+local KEYBINDS_TAB_ICON = "rbxassetid://8677931999"
+-- KEYBINDS tab: rebinds the first key of CONFIG.Keys[Action] (gamepad keys in the same list stay).
+local KEYBIND_ROWS = {
+	{ Action = "Crouch", Name = "Crouch", Icon = "rbxassetid://10238983204", Desc = "Crouch and slide" },
+	{ Action = "ThirdPerson", Name = "Change POV", Icon = "rbxassetid://14333878755", Desc = "Switch first / third person" },
+	{ Action = "Emote", Name = "Emote", Icon = "rbxassetid://11660911888", Desc = "Open the emote wheel, or stop emoting" },
+	{ Action = "EmotePage", Name = "Emote Page", Icon = "rbxassetid://11660911888", Desc = "Next page on the emote wheel" },
+	{ Action = "Settings", Name = "Settings Menu", Icon = "rbxassetid://302250236", Desc = "Open or close this menu" },
+	{ Action = "Unload", Name = "Unload Script", Icon = "rbxassetid://302250236", Desc = "Turn the script off" },
+}
+
+-- Key labels on the KEYBINDS tab (and the emote wheel's page hint).
+function UI.RefreshKeybinds()
+	for _, e in UI.KeyEntries or {} do
+		local waiting = UI.CapturingKey == e
+		local key = CONFIG.Keys[e.Action][1]
+		e.Label.Text = waiting and "..." or (key and key.Name or "-")
+		e.Button.BackgroundColor3 = waiting and Color3.fromRGB(212, 175, 122) or Color3.fromRGB(25, 25, 25)
+	end
+	for _, w in UI.EmoteWheels or {} do
+		local hint = w.DoubleSlots.TextButton:FindFirstChild("TextLabel")
+		if hint and hint.Visible then
+			hint.Text = "[" .. CONFIG.Keys.EmotePage[1].Name .. "]"
+		end
+	end
+end
 
 -- Where each setting lives in CONFIG (all saved to settings.json).
 local SETTING_BINDINGS = {
@@ -4967,6 +5100,16 @@ function UI.LoadSettings()
 			CONFIG[b[1]][b[2]] = v
 		end
 	end
+	if type(data.Keybinds) == "table" then
+		for action, name in data.Keybinds do
+			local ok, key = pcall(function()
+				return Enum.KeyCode[name]
+			end)
+			if ok and key and type(CONFIG.Keys[action]) == "table" then
+				CONFIG.Keys[action][1] = key
+			end
+		end
+	end
 end
 
 function UI.SaveSettings()
@@ -4974,6 +5117,10 @@ function UI.SaveSettings()
 		local data = {}
 		for kind in SETTING_BINDINGS do
 			data[kind] = getSetting(kind)
+		end
+		data.Keybinds = {}
+		for _, row in KEYBIND_ROWS do
+			data.Keybinds[row.Action] = CONFIG.Keys[row.Action][1].Name
 		end
 		return HttpService:JSONEncode(data)
 	end)
@@ -5018,15 +5165,36 @@ function UI.BuildSettings(maid, parent)
 	view.Parent = views
 	local center = view.Center.Center
 
-	-- Header: one tab per category (Evade has Volume / Visuals / Game; only Game applies here) + exit.
+	-- Header: one tab per category (Evade has Volume / Visuals / Game; here Game + Keybinds) + exit.
+	-- MEASURED Views/Settings: tabs are TopButton clones, (1 - TopExit width) / 3 wide; the active one is gold.
 	local exitScale = EVADE_UI.TopExit[1].Props.Size.X.Scale
-	local tab = buildRows(EVADE_UI.TopButton)
-	tab.Size = UDim2.new((1 - exitScale) / 3, 0, 1, 0)
-	tab.TextButton.ImageLabel.Image = GAME_TAB_ICON
-	tab.TextButton.TextLabel.Text = "GAME"
-	setTopButtonActive(tab, true)
-	tab.Parent = center.Header
+	local tabs, tabRows = {}, { GAME = {}, KEYBINDS = {} }
+	local function selectTab(name)
+		for n, t in tabs do
+			setTopButtonActive(t, n == name)
+		end
+		for n, rows in tabRows do
+			for _, row in rows do
+				row.Visible = n == name -- UIGridLayout skips invisible rows
+			end
+		end
+		center.ScrollingFrame.CanvasPosition = Vector2.zero
+	end
+	for i, def in { { "GAME", GAME_TAB_ICON }, { "KEYBINDS", KEYBINDS_TAB_ICON } } do
+		local tab = buildRows(EVADE_UI.TopButton)
+		tab.Name = def[1]
+		tab.LayoutOrder = i
+		tab.Size = UDim2.new((1 - exitScale) / 3, 0, 1, 0)
+		tab.TextButton.ImageLabel.Image = def[2]
+		tab.TextButton.TextLabel.Text = def[1]
+		tab.Parent = center.Header
+		tabs[def[1]] = tab
+		maid:Give(tab.TextButton.Activated:Connect(function()
+			selectTab(def[1])
+		end))
+	end
 	local exit = buildRows(EVADE_UI.TopExit)
+	exit.LayoutOrder = 10
 	exit.Parent = center.Header
 	maid:Give(exit.TextButton.Activated:Connect(function()
 		UI.ToggleSettings(false)
@@ -5071,7 +5239,65 @@ function UI.BuildSettings(maid, parent)
 		setSettingValue(entry, entry.Value)
 		table.insert(UI.SettingEntries, entry)
 		inst.Parent = center.ScrollingFrame
+		table.insert(tabRows.GAME, inst)
 	end
+
+	-- KEYBINDS tab: Evade's Boolean row with the key name on its button.  Click it, then press a key
+	-- (Escape cancels).  While waiting, UI.CapturingKey blocks every bind (see bindInput).
+	UI.KeyEntries = {}
+	for i, def in KEYBIND_ROWS do
+		local inst = buildRows(EVADE_UI.Boolean)
+		inst.LayoutOrder = 100 + i
+		inst.Center.Frame.Type.Text = def.Name
+		local desc = inst.Center.Frame:FindFirstChild("Desc")
+		if desc then
+			desc.Text = def.Desc
+		end
+		inst.Center.Frame.Icon.Image = def.Icon
+		local button = inst.Center.TextButton
+		button.Enabled.Visible = false
+		local label = make("TextLabel", {
+			Name = "Key", BackgroundTransparency = 1, AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5),
+			Size = UDim2.fromScale(0.9, 0.6), TextScaled = true, TextColor3 = Color3.new(1, 1, 1),
+			FontFace = Font.new("rbxasset://fonts/families/GothamSSm.json", Enum.FontWeight.Bold),
+		})
+		label.ZIndex = button.Enabled.ZIndex -- the menu uses Global ZIndex: draw where the check image was
+		label.Parent = button
+		local stroke = Instance.new("UIStroke")
+		stroke.Thickness, stroke.Transparency = 2, 0.5
+		stroke.Parent = label
+		local entry = { Instance = inst, Action = def.Action, Label = label, Button = button }
+		table.insert(UI.KeyEntries, entry)
+		maid:Give(button.Activated:Connect(function()
+			if UI.CapturingKey then
+				return
+			end
+			UI.CapturingKey = entry
+			UI.RefreshKeybinds()
+		end))
+		inst.Visible = false
+		inst.Parent = center.ScrollingFrame
+		table.insert(tabRows.KEYBINDS, inst)
+	end
+	maid:Give(UserInputService.InputBegan:Connect(function(input)
+		local entry = UI.CapturingKey
+		if not entry or input.UserInputType ~= Enum.UserInputType.Keyboard then
+			return
+		end
+		if input.KeyCode ~= Enum.KeyCode.Escape and input.KeyCode ~= Enum.KeyCode.Unknown then
+			CONFIG.Keys[entry.Action][1] = input.KeyCode
+			UI.SaveSettings()
+		end
+		-- cleared after this frame's other InputBegan handlers, so the new key doesn't also fire its action
+		task.defer(function()
+			if UI.CapturingKey == entry then
+				UI.CapturingKey = nil
+			end
+			UI.RefreshKeybinds()
+		end)
+	end))
+	selectTab("GAME")
+	UI.RefreshKeybinds()
 
 	-- Slider drag (MEASURED Views/Settings.Update): percentage of the Max bar, floored, then floored value.
 	maid:Give(RunService.RenderStepped:Connect(function()
@@ -5136,8 +5362,10 @@ function UI.ToggleSettings(open)
 			entry.Value = getSetting(entry.VisualType)
 			setSettingValue(entry, entry.Value)
 		end
+		UI.RefreshKeybinds()
 	else
 		UI.SelectedSetting = nil
+		UI.CapturingKey = nil
 		UserInputService.MouseBehavior = (CONFIG.Features.EvadeCharacter and UI.MouseBehaviorBeforeSettings) or Enum.MouseBehavior.Default
 		UI.SaveSettings()
 	end
@@ -6085,7 +6313,19 @@ local function bindInput()
 			task.spawn(c.Movement.JumpReact, c.Movement)
 		end
 	end))
+	-- MEASURED KeybindService.IgnoreProcessed: these gamepad keys act even when the game already used the
+	-- input; every other bind is ignored while typing (chat, a TextBox) or when a GUI took the input.
+	local IGNORE_PROCESSED = { Enum.KeyCode.DPadUp, Enum.KeyCode.DPadDown, Enum.KeyCode.DPadLeft, Enum.KeyCode.DPadRight, Enum.KeyCode.ButtonR3, Enum.KeyCode.ButtonSelect }
+	local function allowed(input, processed)
+		if UI.CapturingKey then
+			return false -- the KEYBINDS tab is waiting for a new key
+		end
+		return not processed or table.find(IGNORE_PROCESSED, input.KeyCode) ~= nil
+	end
 	App.Maid:Give(UserInputService.InputBegan:Connect(function(input, processed)
+		if not allowed(input, processed) then
+			return
+		end
 		if input.KeyCode == CONFIG.Keys.Validation then
 			if Validation.Recording then
 				Validation.Stop()
@@ -6096,12 +6336,16 @@ local function bindInput()
 			end
 			return
 		end
-		if input.KeyCode == CONFIG.Keys.Unload and not processed then
+		if isKey(CONFIG.Keys.Unload, input) then
 			GENV.EvadeClone.Unload()
 			return
 		end
+		if isKey(CONFIG.Keys.Settings, input) then
+			UI.ToggleSettings()
+			return
+		end
 		local c = App.Current
-		if not c or processed then
+		if not c then
 			return
 		end
 		if input.KeyCode == CONFIG.Keys.GamepadJump then
@@ -6138,11 +6382,6 @@ local function bindInput()
 		end
 		UI.ToggleEmoteWheel(false)
 	end
-	App.Maid:Give(UserInputService.InputBegan:Connect(function(input, processed)
-		if input.KeyCode == CONFIG.Keys.Settings and not processed then
-			UI.ToggleSettings()
-		end
-	end))
 	-- Mobile buttons (UI.BuildMobile) act on the current character through these handlers.
 	UI.MobileHandlers.Crouch = function(down)
 		local c = App.Current
@@ -6303,7 +6542,7 @@ local function main()
 	else
 		Log.info("Boot", "REAL mode: engine idle, press F8 to log the unmodified character")
 	end
-	Log.info("Boot", ("ready. F8 = validation log, %s = unload"):format(CONFIG.Keys.Unload.Name))
+	Log.info("Boot", ("ready. F8 = validation log, %s = unload"):format(CONFIG.Keys.Unload[1].Name))
 end
 
 local ok, err = pcall(main)
